@@ -21,8 +21,6 @@ TG-SHAP addresses these challenges by grouping features by time instants, signif
 
 ## License
 
-This project is licensed under the MIT License.
-
 ## Acknowledgements
 
 This project is based on the work presented in the master's thesis by Manuel Franco de la Peña, Universidad de Murcia, 2024.
