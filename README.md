@@ -79,10 +79,59 @@ To use the `tg_shap` function provided, you need to have a trained ML/DL model, 
 By following these steps, you can utilize the TG-SHAP method to gain insights into the interpretability of your ML/DL model's predictions on time series data. An example of use can be found [here](ExampleOfUse.ipynb)
 
 
+## Installation
+
+Before you can install and use TG-SHAP, ensure that you have the following prerequisites:
+
+1. **Python**: TG-SHAP requires Python 3.6 or later. You can download Python from the [official website](https://www.python.org/downloads/).
+2. **pip**: This is the package installer for Python. It is usually included with Python, but you can install or upgrade it using the following command:
+
+   ```sh
+   python -m ensurepip --upgrade
+   ```
+
+To install TG-SHAP, follow these steps:
+
+1. **Clone the Repository**: First, clone the TG-SHAP repository from GitHub. Open your terminal or command prompt and run:
+   ```sh
+   git clone https://github.com/ManuelFranco/TG-SHAP.git
+   ```
+
+2. **Navigate to the Directory**: Change to the TG-SHAP directory:
+   ```sh
+   cd TG-SHAP
+   ```
+
+3. **Install Dependencies**: Install the required dependencies using pip. The required packages are listed in the \`requirements.txt\` file. Run:
+   ```sh
+   pip install -r requirements.txt
+   ```
+
+4. **Install TG-SHAP**: Finally, install TG-SHAP:
+   ```sh
+   pip install .
+   ```
+
+## Verification
+
+To verify that TG-SHAP has been installed correctly, you can run a simple test. Open a Python interpreter and try importing the package:
+```python
+import tg_shap
+print("TG-SHAP installed successfully!")
+```
+
+If there are no errors, the installation was successful.
+
+
 ## License
 
 MIT License
 
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ## Acknowledgements
 
 This project is based on the work presented in the master's thesis by Manuel Franco de la Peña, Universidad de Murcia, 2024.
