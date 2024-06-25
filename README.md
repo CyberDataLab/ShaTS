@@ -70,19 +70,13 @@ To use the `tg_shap` function provided, you need to have a trained ML/DL model, 
    - `TestDataset`: The dataset on which the interpretability analysis will be performed.
    - `windowSize`: The size of the time window for the time series data.
 
-Example usage in Python:
-
-```python
-sumas, shapley_values, diccionario_shap_aciertos, df = tg_shap(MODEL, SupportDataset, TestDataset, windowSize)
-```
-
 5. **Analyze the Results**: The function returns several outputs:
     + `sumas`: A tensor containing the sum of Shapley values for each instance in the test dataset.
     + `shapley_values`: A tensor containing the Shapley values for each time instant in each instance.
     + `diccionario_shap_aciertos`: A dictionary indicating whether the predicted class matches the actual class for each instance.
     + `df`: A DataFrame with detailed results including Shapley values, predicted probabilities, and accuracy information.
 
-By following these steps, you can utilize the TG-SHAP method to gain insights into the interpretability of your ML/DL model's predictions on time series data.
+By following these steps, you can utilize the TG-SHAP method to gain insights into the interpretability of your ML/DL model's predictions on time series data. An example of use can be found [here](ExampleOfUse.ipynb)
 
 
 ## License
