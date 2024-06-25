@@ -17,7 +17,7 @@ The Shapley value method, rooted in cooperative game theory, is a model-agnostic
 
 ### TG-SHAP
 
-TG-SHAP addresses these challenges by grouping features by time instants, significantly reducing the computational complexity from \(2^{p \cdot w}\) to \(2^w\), where \(p\) is the number of features measured at each instant and \(w\) is the number of time instants in a window. This transformation maintains the interpretability of the model's decisions, helping identify which time instants most influence the model's predictions.
+TG-SHAP addresses these challenges by grouping features by time instants, significantly reducing the computational complexity from ![equation](https://latex.codecogs.com/svg.image?2^{p\cdot&space;w}) to \(2^w\), where \(p\) is the number of features measured at each instant and \(w\) is the number of time instants in a window. This transformation maintains the interpretability of the model's decisions, helping identify which time instants most influence the model's predictions.
 
 ## License
 
