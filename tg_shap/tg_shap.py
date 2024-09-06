@@ -2,7 +2,7 @@
 import torch
 import pandas as pd
 import math
-from .utils import all_subsets, all_subsets_without
+from .utils import all_subsets, all_subsets_without, generateRandomSubsets
 
 def tg_shap(MODEL, SupportDataset, TestDataset, windowSize):
     
