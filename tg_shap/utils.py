@@ -1,5 +1,6 @@
 from itertools import combinations
 import math
+import random
 
 def all_subsets(subventanas):
     all_subsets_con = []
