@@ -1,4 +1,5 @@
 from itertools import combinations
+import math
 
 def all_subsets(subventanas):
     all_subsets_con = []
