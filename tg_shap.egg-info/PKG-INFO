@@ -1,3 +1,17 @@
+Metadata-Version: 2.1
+Name: tg_shap
+Version: 0.2.0
+Summary: Paquete para usar TG-SHAP
+Home-page: https://github.com/ManuelFranco/TG-SHAP
+Author: Manuel Franco de la Peña
+Author-email: manuel.francop@um.es
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Requires-Dist: torch
+Requires-Dist: pandas
+
 
 # TS-SHAP Package
 

@@ -1,10 +1,10 @@
-# my_shap_package/tg_shap.py
+# my_shap_package/ts_shap.py
 import torch
 import pandas as pd
 import math
 from .utils import all_subsets, all_subsets_without, generateRandomSubsets
 
-def tg_shap(MODEL, SupportDataset, TestDataset, windowSize):
+def ts_shap(MODEL, SupportDataset, TestDataset, windowSize):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sumas = torch.zeros(len(TestDataset), device=device)
@@ -114,7 +114,7 @@ def tg_shap(MODEL, SupportDataset, TestDataset, windowSize):
 
 
 
-def approx_tg_shap(MODEL, SupportDataset, TestDataset, m, groupingCriteria='TIME', batch_size=32):
+def approx_ts_shap(MODEL, SupportDataset, TestDataset, m, groupingCriteria='TIME', batch_size=32):
     
     windowSize = TestDataset[0]['given'].shape[0]
     num_predictores = TestDataset[0]['given'].shape[1]
