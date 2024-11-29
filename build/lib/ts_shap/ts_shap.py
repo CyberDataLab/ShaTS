@@ -2,7 +2,6 @@
 import torch
 import pandas as pd
 import math
-from enum import Enum
 from .utils import all_subsets, all_subsets_without, generateRandomSubsets
 
 def ts_shap(MODEL, SupportDataset, TestDataset, windowSize):
