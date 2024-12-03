@@ -2,3 +2,5 @@ torch
 pandas
 math
 random
+numpy
+matplotlib

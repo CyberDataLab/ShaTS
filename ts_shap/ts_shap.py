@@ -2,6 +2,8 @@
 import torch
 import pandas as pd
 import math
+import numpy as np
+import matplotlib.pyplot as plt
 from enum import Enum
 from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generate_subsets
 
@@ -22,9 +24,10 @@ class TSSHAP:
                  nameInstants = None,
                  verbose = 0,
                  nclass = 2,
+                 classToExplain = -1
                  ):
         
-        print("He cambiado esto 3 veces")
+        print("He cambiado esto 5 veces")
         self.model = model
         self.supportDataset = supportDataset
         self.supportTensor = torch.stack([data['given'] for data in supportDataset]).to(device)
@@ -39,6 +42,7 @@ class TSSHAP:
         self.batch_size = batch_size
         self.verbose = verbose
         self.nclass = nclass
+        self.classToExplain = classToExplain
 
         self._initialize_groups(nameFeatures, nameGroups, nameInstants)
         
@@ -54,11 +58,11 @@ class TSSHAP:
 
 
     def _initialize_groups(self, nameFeatures, nameGroups, nameInstants):
-        if self.strategyGrouping == StrategyGrouping.TIME:
+        if self.strategyGrouping.value == StrategyGrouping.TIME.value:
             self.numGroups = self.windowSize
-        elif self.strategyGrouping == StrategyGrouping.FEATURE:
+        elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
             self.numGroups = self.numFeatures
-        elif self.strategyGrouping == StrategyGrouping.PROCESS:
+        elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
             if not self.customGroups:
                 raise ValueError("Custom groups are required for PROCESS strategy.")
             self.numGroups = len(self.customGroups)
@@ -83,14 +87,16 @@ class TSSHAP:
             for i in range(0, len(self.supportDataset), self.batch_size):
                 batch = self.supportDataset[i:i + self.batch_size]
                 batch_tensor = torch.stack([data['given'] for data in batch]).to(self.device)
-                mean_prediction += torch.sum(torch.softmax(self.model(batch_tensor), dim=1), dim=0)
+                mean_prediction += torch.sum(torch.softmax(self.model(batch_tensor), dim=1), dim=0) if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sum(torch.sigmoid(self.model(batch_tensor)), dim=0)
         return mean_prediction / len(self.supportDataset)
     
     def _getPrediction(self, data):
 
         pred_original = self.model(data['given'].unsqueeze(0).to(self.device))
-        class_original = torch.argmax(pred_original) if self.strategyPrediction.value == StrategyPrediction.MULTICLASS else 0
-        prob_original = torch.softmax(pred_original, dim=1)[0][class_original] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS else torch.sigmoid(pred_original)[0][0]
+        class_original = torch.argmax(pred_original) if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else 0
+        if self.classToExplain != -1:
+            class_original = self.classToExplain
+        prob_original = torch.softmax(pred_original, dim=1)[0][class_original] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sigmoid(pred_original)[0][0]
 
         return pred_original, class_original, prob_original
     
@@ -129,7 +135,7 @@ class TSSHAP:
             batch = torch.cat(modified_data_batches[i:i + self.batch_size]).to(self.device)
             guesses = self.model(batch)
             
-            batch_probs = torch.softmax(guesses, dim=1)[:, class_original] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS else torch.sigmoid(guesses)[:, 0]
+            batch_probs = torch.softmax(guesses, dim=1)[:, class_original] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sigmoid(guesses)[:, 0]
             probs.extend(batch_probs.cpu())
             
         return torch.tensor(probs, device=self.device)
@@ -150,7 +156,7 @@ class TSSHAP:
         return prob_with, prob_without
 
     
-    def compute_shap(self, testDataset):
+    def compute_tsshap(self, testDataset):
         tsshapvalues_list = torch.zeros(len(testDataset), self.numGroups, device=self.device)
 
         with torch.no_grad():
@@ -168,450 +174,112 @@ class TSSHAP:
                 for group in range(self.numGroups):
                     for size in range(self.numGroups):
                         prob_with, prob_without = self._computeDifferences(probs, group, size)
-                        tsshapvalues[group] += (prob_with - prob_without).mean()
+                        tsshapvalues[group] += (prob_without - prob_with).mean()
 
                 tsshapvalues_list[idx] = tsshapvalues.clone()
-                
+
+                #free memory
+                del modified_data_batches, probs, pred_original, class_original, prob_original, tsshapvalues
+                torch.cuda.empty_cache()
+        
         return tsshapvalues_list
-
-
-
-
-
-
-##################### LEGACY #####################
-
-
-
-#FUNCION QUE SE USA ACTUALMENTE SIN EL PAQUETE
-def USOaCTUAL(MODEL, SupportDataset, TestDataset, m, groupingCriteria='TIME', batch_size=32, multiGroups=None):
     
-    windowSize = TestDataset[0]['given'].shape[0]
-    num_predictores = TestDataset[0]['given'].shape[1]
-    
-    if groupingCriteria == 'TIME':
-        nGroups = windowSize
-    elif groupingCriteria == 'PREDICTOR':
-        nGroups = num_predictores
-    elif groupingCriteria == 'MULTIPREDICTOR':
-        if multiGroups is None:
-            raise ValueError("Para 'MULTIPREDICTOR', se debe proporcionar el argumento 'multiGroups'.")
-        nGroups = len(multiGroups)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sumas = torch.zeros(len(TestDataset), device=device)
-    shapley_values = torch.zeros(len(TestDataset), nGroups, device=device)
-    
-    subsets_total = set()
-    
-    subsets_dict = {}
-    respuestas = {}
-    diccionario_shap_aciertos = {}
-    
+    def visualize_tsshap(self, 
+                       shapley_values, 
+                       testDataset = None, 
+                       model_predictions = None, 
+                       path=None,
+                       segmentSize=100):
 
-    subsets_dict, subsets_total = tg_shap.generateRandomSubsets(nGroups, m)
+        if model_predictions is None:
+            if testDataset is None:
+                raise ValueError("If model_predictions is not provided, testDataset must be provided.")
+            model_predictions = [self._getPrediction(data) for data in testDataset]
 
-    ###########################################################
-    j = 0
+        fontsize = 25
+        size = shapley_values.shape[0]
 
-    shap_columns = [f'shap{i+1}' for i in range(nGroups)]
-    columns = ['idx', 'k', 'clase_predicha', 'clase_real'] + shap_columns + ['prob_predicha', 'suma_shap', 'aciertos']
-    
-    df = pd.DataFrame(columns=columns)
-    
-    with torch.no_grad():
+        arr_plot = np.zeros((self.numGroups, size))
+        arr_prob = np.zeros(size)
+
+        for i in range(size):
+            arr_plot[:, i] = shapley_values[i].cpu().numpy()
+            arr_prob[i] = model_predictions[i][2].detach().cpu().numpy()
         
-        prediccion_media = torch.zeros(2, device=device)
+        vmin, vmax = -0.5, 0.5
+        cmap = plt.get_cmap('bwr')
+
+        nSegments = (size + segmentSize - 1) // segmentSize
+        fig, axs = plt.subplots(nSegments, 1, figsize=(15, 25 * (max(10, self.numGroups)/36) * nSegments)) #15, 25 predictor
         
-        for i in range(0, len(SupportDataset), batch_size):
-            batch = SupportDataset[i:i + batch_size]
-            batch_tensor = torch.stack([data['given'] for data in batch]).to(device)
-            prediccion_media += torch.sum(torch.softmax(MODEL(batch_tensor), dim=1), dim=0)
+        if nSegments == 1:
+            axs = [axs]
         
-        prediccion_media /= len(SupportDataset)
+        for n in range(nSegments):
+            if n == nSegments - 1:
+                arr_plot = np.hstack((arr_plot, np.zeros((self.numGroups, segmentSize - (size % segmentSize)))))
+                size = arr_plot.shape[1]
+            
+            ax = axs[n]
+            init = n * segmentSize
+            end = min((n + 1) * segmentSize, size)
+            segment = arr_plot[:, init:end]
+
+            ax.set_xlabel('Window', fontsize=fontsize)
+
+            cax = ax.imshow(segment, cmap=cmap, interpolation='nearest', vmin=vmin, vmax=vmax, aspect='auto')
+            
+                    # Crear un nuevo eje para la barra de color, asegurando que coincida con el tamaño del eje principal
+            cbar_ax = fig.add_axes([ax.get_position().x1 + 0.15,  # Posición horizontal (ligeramente a la derecha del eje)
+                                    ax.get_position().y0 - 0.05,          # Mismo comienzo vertical que el eje principal
+                                    0.05,                          # Ancho de la barra de color
+                                    ax.get_position().height + 0.125])     # Altura de la barra de color igual a la del eje principal
+
+            cbar = fig.colorbar(cax, cax=cbar_ax, orientation='vertical')
+            cbar.ax.tick_params(labelsize=fontsize)
+            
+            ax2 = ax.twinx()
+
+            prediction = arr_prob[init:end]
+
+            ax2.plot(np.arange(init, end), prediction, linestyle='--', color='darkviolet', linewidth=4)
+            
+            ax2.axhline(0.5, color='black', linewidth=1, linestyle='--')
+            ax2.set_ylim(0, 1)
+            ax2.tick_params(axis='y', labelsize=fontsize)
+
+            ax2.set_ylabel('Model outcome', fontsize=fontsize)
+            
+            legend = ax2.legend(['Model outcome', 'Threshold'], fontsize=fontsize, loc = 'lower left', bbox_to_anchor=(0.0, -0.0))
+            legend.get_frame().set_alpha(None)
+            legend.get_frame().set_facecolor((0, 0, 0, 0))
+            legend.get_frame().set_edgecolor('black')
+
+            #switch case of the ylabel depending on the grouping strategy
+            if self.strategyGrouping.value == StrategyGrouping.TIME.value:
+                ylabel = 'Time'
+                textName = 'TS-SHAP (Temporal)'
+                nameColumns = self.nameInstants
+            elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
+                ylabel = 'Feature'
+                textName = 'TS-SHAP (Feature)'
+                nameColumns = self.nameFeatures
+            elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
+                ylabel = 'Process'
+                textName = 'TS-SHAP (Process)'
+                nameColumns = self.nameGroups
+
+            ax.set_ylabel(ylabel, fontsize=fontsize)
+            ax.set_title(textName, fontsize=fontsize)
+
+            ax.set_yticks(np.arange(self.numGroups))
+            ax.set_yticklabels(nameColumns, fontsize=fontsize)
+
+            ax.set_xticks(np.arange(0, segment.shape[1], 5))
+            ax.set_xticklabels(np.arange(init, end, 5), fontsize=fontsize)
         
-        for idx in range(len(TestDataset)):
-            data = TestDataset[idx]
-                
-            support_tensor = torch.stack([data['given'] for data in SupportDataset]).to(device)
-            data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-            
-            diferencias_medias_acumuladas = torch.zeros(nGroups, device=device)
-            pred_original = MODEL(data['given'].unsqueeze(0).to(device))
-            class_original = torch.argmax(pred_original)
-            #class_original = 0
-            prob_original = torch.softmax(pred_original, dim=1)[0][class_original]
-            
-            modified_data_batches = []
-            subset_vecino_pairs = []
-            
-            if groupingCriteria == 'TIME':
-                for subset in subsets_total:
-                    data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-                    indices = torch.tensor(list(subset), dtype=torch.long, device=device)
-                    data_tensor[:, indices, :] = support_tensor[:, indices, :].clone()
-                    modified_data_batches.append(data_tensor.clone())
-                    subset_vecino_pairs.extend([(tuple(subset), vecino) for vecino in range(len(SupportDataset))])
-            
-            elif groupingCriteria == 'PREDICTOR':
-                for subset in subsets_total:
-                    data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-                    indices = torch.tensor(list(subset), dtype=torch.long, device=device)
-                    for instante in range(windowSize):
-                        data_tensor[:, instante, indices] = support_tensor[:, instante, indices].clone()
-                    modified_data_batches.append(data_tensor.clone())
-                    subset_vecino_pairs.extend([(tuple(subset), vecino) for vecino in range(len(SupportDataset))])
-            
-            elif groupingCriteria == 'MULTIPREDICTOR':
-                for subset in subsets_total:
-                    data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-                    indices = [multiGroups[group] for group in subset]
-                    for instante in range(windowSize):
-                        for group_indices in indices:
-                            data_tensor[:, instante, group_indices] = support_tensor[:, instante, group_indices].clone()
-                    modified_data_batches.append(data_tensor.clone())
-                    subset_vecino_pairs.extend([(tuple(subset), vecino) for vecino in range(len(SupportDataset))])
-            
-            # Procesar los datos en lotes
-            probs = []
-            for i in range(0, len(modified_data_batches), batch_size):
-                batch = torch.cat(modified_data_batches[i:i + batch_size]).to(device)
-                guesses = MODEL(batch)
-                batch_probs = torch.softmax(guesses, dim=1)[:, class_original]
-                probs.extend(batch_probs.cpu())
-            probs = torch.tensor(probs, device=device)
-    
-            respuestas = {pair: probs[i] for i, pair in enumerate(subset_vecino_pairs)}
-            pair_indices = {(subset, vecino): i for i, (subset, vecino) in enumerate(subset_vecino_pairs)}
-            
-            for instante in range(nGroups):
-                for size in range(nGroups):
-                    subsets_con, subsets_sin = subsets_dict[(instante, size)]
-    
-                    prob_con_media = torch.zeros(len(subsets_con), device=device)
-                    prob_sin_media = torch.zeros(len(subsets_sin), device=device)
-                        
-                    for i, (s_con, s_sin) in enumerate(zip(subsets_con, subsets_sin)):
-                        
-                        indices_con = [pair_indices[(tuple(s_con), vecino)] for vecino in range(len(SupportDataset))]
-                        indices_sin = [pair_indices[(tuple(s_sin), vecino)] for vecino in range(len(SupportDataset))]
-                        
-                        coef = 1 / nGroups
-                        pesos = torch.ones(len(SupportDataset), device=device)
-                            
-                        pesos /= torch.sum(pesos)                            
-                        
-                        #prob_con_media[i] no debe ser la media sino la suma multiplicando por distancias
-                        prob_con_media[i] = torch.sum(probs[indices_con] * pesos) * coef
-                        prob_sin_media[i] = torch.sum(probs[indices_sin] * pesos) * coef
-                        
-    
-                    diferencias = (prob_sin_media - prob_con_media)
-                    diferencias_medias_acumuladas[instante] += diferencias.mean()
-    
-            shapley_values[j] = diferencias_medias_acumuladas.clone()           
-    
-            print(j)
-            print("Prediccion media:", prediccion_media[0], prediccion_media[1])
-            print("Suma de importancias:", diferencias_medias_acumuladas.sum() + prediccion_media[class_original])
-            print(f"Probabilidad original: {torch.softmax(pred_original, dim=1)[0][class_original]}")
-            print(f"shapley_values: {diferencias_medias_acumuladas.sum()}")
-            sumas[j] = diferencias_medias_acumuladas.sum() - prob_original
-            
-            clase_predicha = torch.argmax(pred_original)
-            clase_real = TestDataset[idx]['answer']
-            
-            clase_real = torch.argmax(clase_real)
-            
-            #diccionario_shap_aciertos[j] = 1
-            
-            if clase_predicha == clase_real:
-                diccionario_shap_aciertos[j] = 1
-            else:
-                diccionario_shap_aciertos[j] = 0
-            
-            
-            diferencias_medias_acumuladas = diferencias_medias_acumuladas.cpu().numpy()
-            
-            df_data = {
-                'idx': idx, 'k': len(SupportDataset),
-                'clase_predicha': clase_predicha.cpu().numpy().item(),
-                'clase_real': clase_real.cpu().numpy().item(), 'prob_predicha': prob_original.cpu().numpy().item(),
-                'suma_shap': diferencias_medias_acumuladas.sum(), 'aciertos': diccionario_shap_aciertos[j]
-            }
-            for i in range(nGroups):
-                df_data[f'shap{i+1}'] = diferencias_medias_acumuladas[i]
-            
-            df.loc[len(df)] = df_data
-            
-            j += 1
-            # Liberar memoria
-            del support_tensor, data_tensor, modified_data_batches, guesses, probs
-            torch.cuda.empty_cache()
-                
-    return sumas, shapley_values, diccionario_shap_aciertos, df
+        plt.tight_layout()
 
-
-
-
-def ts_shap(MODEL, SupportDataset, TestDataset, windowSize):
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sumas = torch.zeros(len(TestDataset), device=device)
-    shapley_values = torch.zeros(len(TestDataset), windowSize, device=device)
-
-    subsets_total = all_subsets(windowSize)
-    
-    subsets_dict = {}
-    coef_dict = {}
-    respuestas = {}
-    diccionario_shap_aciertos = {}
-    
-    for i in range(windowSize):
-        subsets_dict[i] = all_subsets_without(windowSize, i)
-        coef_dict[i] = math.factorial(i) * math.factorial(windowSize - i - 1) / math.factorial(windowSize)
-    
-    j = 0
-
-    shap_columns = [f'shap{i+1}' for i in range(windowSize)]
-    columns = ['idx', 'k', 'simulationRun', 'sample', 'clase_predicha', 'clase_real'] + shap_columns + ['prob_predicha', 'suma_shap', 'aciertos']
-    
-    df = pd.DataFrame(columns=columns)
-    
-    
-    with torch.no_grad():
-        for idx in range(len(TestDataset)):
-            
-            diferencias_medias_acumuladas = torch.zeros(windowSize, device=device)
-            data = TestDataset[idx]
-            pred_original = MODEL(data['given'].unsqueeze(0).to(device))
-            class_original = torch.argmax(pred_original)
-            prob_original = torch.softmax(pred_original, dim=1)[0][class_original]
-            
-            modified_data_batches = []
-            subset_vecino_pairs = []            
-
-            for subset in subsets_total:
-                for vecino in range(len(SupportDataset)):
-                    modified_data = TestDataset[idx]['given'].clone()
-                    #print(vecino)
-                    modified_data[subset] = SupportDataset[vecino]['given'][subset]
-                    modified_data_batches.append(modified_data)
-                    subset_vecino_pairs.append((tuple(subset), vecino))
-            
-    
-            modified_data_batch = torch.stack(modified_data_batches).to(device)
-            guesses = MODEL(modified_data_batch)
-            probs = torch.softmax(guesses, dim=1)[:, class_original]
-    
-            for i, pair in enumerate(subset_vecino_pairs):
-                #print(pair)
-                respuestas[pair] = probs[i]
-    
-            pair_indices = {(subset, vecino): i for i, (subset, vecino) in enumerate(subset_vecino_pairs)}
-    
-            for instante in range(windowSize):
-                subsets_con, subsets_sin = subsets_dict[instante]
-    
-                prob_con_media = torch.zeros(len(subsets_con)+1, device=device)
-                prob_sin_media = torch.zeros(len(subsets_sin), device=device)
-    
-                for i, (s_con, s_sin) in enumerate(zip(subsets_con, subsets_sin)):
-                    indices_con = [pair_indices[(tuple(s_con), vecino)] for vecino in range(len(SupportDataset))]
-                    indices_sin = [pair_indices[(tuple(s_sin), vecino)] for vecino in range(len(SupportDataset))]
-    
-                    coef = coef_dict[len(s_sin)]
-                    prob_con_media[i] = probs[indices_con].mean()*coef
-                    prob_sin_media[i] = probs[indices_sin].mean()*coef
-    
-                diferencias = (prob_sin_media - prob_con_media)
-                diferencias_medias_acumuladas[instante] += diferencias.sum()
-    
-            shapley_values[j] = diferencias_medias_acumuladas
-    
-            print(j)
-            print("Suma de importancias:", diferencias_medias_acumuladas.sum())
-            print(f"Probabilidad original: {torch.softmax(pred_original, dim=1)[0][class_original]}")
-            sumas[j] = diferencias_medias_acumuladas.sum() - prob_original
-            
-            clase_predicha = torch.argmax(pred_original)
-            clase_real = TestDataset[idx]['answer']
-            
-            if clase_predicha == clase_real:
-                diccionario_shap_aciertos[j] = 1
-            else:
-                diccionario_shap_aciertos[j] = 0
-            
-            
-            diferencias_medias_acumuladas = diferencias_medias_acumuladas.cpu().numpy()
-            # rellenar dataframe
-            
-            df_data = {
-                'idx': idx, 'k': len(SupportDataset), 'simulationRun': TestDataset[idx]['simulationRun'],
-                'sample': TestDataset[idx]['sample'], 'clase_predicha': clase_predicha.cpu().numpy().item(),
-                'clase_real': clase_real.cpu().numpy().item(), 'prob_predicha': prob_original.cpu().numpy().item(),
-                'suma_shap': diferencias_medias_acumuladas.sum(), 'aciertos': diccionario_shap_aciertos[j]
-            }
-            for i in range(windowSize):
-                df_data[f'shap{i+1}'] = diferencias_medias_acumuladas[i]
-            
-            df.loc[len(df)] = df_data
-            
-            
-            j += 1
-                
-    return sumas, shapley_values, diccionario_shap_aciertos, df
-
-
-
-def approx_ts_shap(MODEL, SupportDataset, TestDataset, m, groupingCriteria='TIME', batch_size=32):
-    
-    windowSize = TestDataset[0]['given'].shape[0]
-    num_predictores = TestDataset[0]['given'].shape[1]
-    
-    if groupingCriteria == 'TIME':
-        nGroups = windowSize
-    elif groupingCriteria == 'PREDICTOR':
-        nGroups = num_predictores
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sumas = torch.zeros(len(TestDataset), device=device)
-    shapley_values = torch.zeros(len(TestDataset), nGroups, device=device)
-    
-    subsets_total = set()
-    
-    subsets_dict = {}
-    respuestas = {}
-    diccionario_shap_aciertos = {}
-    
-
-    subsets_dict, subsets_total = generateRandomSubsets(nGroups, m)
-
-    ###########################################################
-    j = 0
-
-    shap_columns = [f'shap{i+1}' for i in range(nGroups)]
-    columns = ['idx', 'k', 'clase_predicha', 'clase_real'] + shap_columns + ['prob_predicha', 'suma_shap', 'aciertos']
-    
-    df = pd.DataFrame(columns=columns)
-    
-    with torch.no_grad():
-        
-        prediccion_media = torch.zeros(21, device=device)
-        
-        for i in range(0, len(SupportDataset), batch_size):
-            batch = SupportDataset[i:i + batch_size]
-            batch_tensor = torch.stack([data['given'] for data in batch]).to(device)
-            prediccion_media += torch.sum(torch.softmax(MODEL(batch_tensor), dim=1), dim=0)
-        
-        prediccion_media /= len(SupportDataset)
-        
-        for idx in range(len(TestDataset)):
-            data = TestDataset[idx]
-                
-            
-            support_tensor = torch.stack([data['given'] for data in SupportDataset]).to(device)
-            data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-            
-            diferencias_medias_acumuladas = torch.zeros(nGroups, device=device)
-            pred_original = MODEL(data['given'].unsqueeze(0).to(device))
-            class_original = torch.argmax(pred_original)
-            prob_original = torch.softmax(pred_original, dim=1)[0][class_original]
-            
-            modified_data_batches = []
-            subset_vecino_pairs = []
-            
-            if groupingCriteria == 'TIME':
-                for subset in subsets_total:
-                    data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-                    indices = torch.tensor(list(subset), dtype=torch.long, device=device)
-                    data_tensor[:, indices, :] = support_tensor[:, indices, :].clone()
-                    modified_data_batches.append(data_tensor.clone())
-                    subset_vecino_pairs.extend([(tuple(subset), vecino) for vecino in range(len(SupportDataset))])
-            
-            elif groupingCriteria == 'PREDICTOR':
-                for subset in subsets_total:
-                    data_tensor = data['given'].unsqueeze(0).expand(len(SupportDataset), *data['given'].shape).clone().to(device)
-                    indices = torch.tensor(list(subset), dtype=torch.long, device=device)
-                    for instante in range(windowSize):
-                        data_tensor[:, instante, indices] = support_tensor[:, instante, indices].clone()
-                    modified_data_batches.append(data_tensor.clone())
-                    subset_vecino_pairs.extend([(tuple(subset), vecino) for vecino in range(len(SupportDataset))])
-            
-            # Procesar los datos en lotes
-            probs = []
-            for i in range(0, len(modified_data_batches), batch_size):
-                batch = torch.cat(modified_data_batches[i:i + batch_size]).to(device)
-                guesses = MODEL(batch)
-                batch_probs = torch.softmax(guesses, dim=1)[:, class_original]
-                probs.extend(batch_probs.cpu())
-            probs = torch.tensor(probs, device=device)
-    
-            respuestas = {pair: probs[i] for i, pair in enumerate(subset_vecino_pairs)}
-            pair_indices = {(subset, vecino): i for i, (subset, vecino) in enumerate(subset_vecino_pairs)}
-            
-            for instante in range(nGroups):
-                for size in range(nGroups):
-                    subsets_con, subsets_sin = subsets_dict[(instante, size)]
-    
-                    prob_con_media = torch.zeros(len(subsets_con), device=device)
-                    prob_sin_media = torch.zeros(len(subsets_sin), device=device)
-                        
-                    for i, (s_con, s_sin) in enumerate(zip(subsets_con, subsets_sin)):
-                        
-                        indices_con = [pair_indices[(tuple(s_con), vecino)] for vecino in range(len(SupportDataset))]
-                        indices_sin = [pair_indices[(tuple(s_sin), vecino)] for vecino in range(len(SupportDataset))]
-                        
-                        coef = 1 / nGroups
-                        pesos = torch.ones(len(SupportDataset), device=device)
-                            
-                        pesos /= torch.sum(pesos)                            
-                        
-                        #prob_con_media[i] no debe ser la media sino la suma multiplicando por distancias
-                        prob_con_media[i] = torch.sum(probs[indices_con] * pesos) * coef
-                        prob_sin_media[i] = torch.sum(probs[indices_sin] * pesos) * coef
-                        
-    
-                    diferencias = (prob_sin_media - prob_con_media)
-                    diferencias_medias_acumuladas[instante] += diferencias.mean()
-    
-            shapley_values[j] = diferencias_medias_acumuladas            
-    
-            print(j)
-            print("Suma de importancias:", diferencias_medias_acumuladas.sum() + prediccion_media[class_original])
-            print(f"Probabilidad original: {torch.softmax(pred_original, dim=1)[0][class_original]}")
-            sumas[j] = diferencias_medias_acumuladas.sum() - prob_original
-            
-            clase_predicha = torch.argmax(pred_original)
-            clase_real = TestDataset[idx]['answer']
-            
-            if clase_predicha == clase_real:
-                diccionario_shap_aciertos[j] = 1
-            else:
-                diccionario_shap_aciertos[j] = 0
-            
-            diferencias_medias_acumuladas = diferencias_medias_acumuladas.cpu().numpy()
-            
-            df_data = {
-                'idx': idx, 'k': len(SupportDataset),
-                'clase_predicha': clase_predicha.cpu().numpy().item(),
-                'clase_real': clase_real.cpu().numpy().item(), 'prob_predicha': prob_original.cpu().numpy().item(),
-                'suma_shap': diferencias_medias_acumuladas.sum(), 'aciertos': diccionario_shap_aciertos[j]
-            }
-            for i in range(nGroups):
-                df_data[f'shap{i+1}'] = diferencias_medias_acumuladas[i]
-            
-            df.loc[len(df)] = df_data
-            
-            j += 1
-            # Liberar memoria
-            del support_tensor, data_tensor, modified_data_batches, guesses, probs
-            torch.cuda.empty_cache()
-                
-    return sumas, shapley_values, diccionario_shap_aciertos, df
-
-
-
-#FUNCION POR ACTUALIZAR
-def compute_ts_shap(MODEL, SupportDataset, TestDataset, m, groupingCriteria='TIME', batch_size=32):
-    return 0
+        if path is not None:
+            plt.savefig(path)
+        plt.show()
