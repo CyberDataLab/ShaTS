@@ -46,7 +46,6 @@ class TSSHAP:
 
         self._initialize_groups(nameFeatures, nameGroups, nameInstants)
         
-        #if verbose imprime lo que se está haciendo
         self.subsets_dict, self.all_subsets = generate_subsets(self.numGroups, self.m, self.strategySubsets)
         self.keys_support_subsets = [(tuple(subset), entity) for subset in self.all_subsets for entity in range(len(self.supportDataset))]
         self.pair_dicts = {(subset, entity): i for i, (subset, entity) in enumerate(self.keys_support_subsets)}
