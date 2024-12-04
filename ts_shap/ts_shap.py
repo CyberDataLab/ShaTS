@@ -27,7 +27,7 @@ class TSSHAP:
                  classToExplain = -1
                  ):
         
-        print("He cambiado esto 5 veces")
+        print("He cambiado esto 55 veces")
         self.model = model
         self.supportDataset = supportDataset
         self.supportTensor = torch.stack([data['given'] for data in supportDataset]).to(device)
@@ -182,103 +182,112 @@ class TSSHAP:
                 torch.cuda.empty_cache()
         
         return tsshapvalues_list
-    
+        
     def visualize_tsshap(self, 
-                       shapley_values, 
-                       testDataset = None, 
-                       model_predictions = None, 
-                       path=None,
-                       segmentSize=100):
+                        shapley_values, 
+                        testDataset = None, 
+                        model_predictions = None, 
+                        path=None,
+                        segmentSize=100):
 
-        if model_predictions is None:
-            if testDataset is None:
-                raise ValueError("If model_predictions is not provided, testDataset must be provided.")
-            model_predictions = [self._getPrediction(data) for data in testDataset]
+            if model_predictions is None:
+                if testDataset is None:
+                    raise ValueError("If model_predictions is not provided, testDataset must be provided.")
+                model_predictions = [self._getPrediction(data) for data in testDataset]
 
-        fontsize = 25
-        size = shapley_values.shape[0]
+            fontsize = 25
+            size = shapley_values.shape[0]
 
-        arr_plot = np.zeros((self.numGroups, size))
-        arr_prob = np.zeros(size)
+            arr_plot = np.zeros((self.numGroups, size))
+            arr_prob = np.zeros(size)
 
-        for i in range(size):
-            arr_plot[:, i] = shapley_values[i].cpu().numpy()
-            arr_prob[i] = model_predictions[i][2].detach().cpu().numpy()
+            for i in range(size):
+                arr_plot[:, i] = shapley_values[i].cpu().numpy()
+                arr_prob[i] = model_predictions[i][2].detach().cpu().numpy()
+            
+            vmin, vmax = -0.5, 0.5
+            cmap = plt.get_cmap('bwr')
+
+            nSegments = (size + segmentSize - 1) // segmentSize
+            fig, axs = plt.subplots(nSegments, 1, figsize=(15, 25 * (max(10, self.numGroups)/36) * nSegments)) #15, 25 predictor
+            
+            if nSegments == 1:
+                axs = [axs]
+            
+            for n in range(nSegments):
+                realEnd = min((n + 1) * segmentSize, size)
+                if n == nSegments - 1:
+                    realEnd = arr_plot.shape[1]
+                    arr_plot = np.hstack((arr_plot, np.zeros((self.numGroups, segmentSize - (size % segmentSize)))))
+                    arr_prob = np.hstack((arr_prob, -np.ones(segmentSize - (size % segmentSize))))
+                    size = arr_plot.shape[1]
+                
+                init = n * segmentSize
+                end = min((n + 1) * segmentSize, size)
+                segment = arr_plot[:, init:end]
+                ax = axs[n]
+
+
+                ax.set_xlabel('Window', fontsize=fontsize)
+
+                cax = ax.imshow(segment, cmap=cmap, interpolation='nearest', vmin=vmin, vmax=vmax, aspect='auto')
+                
+                cbar_ax = fig.add_axes([ax.get_position().x1 + 0.15,  
+                                        ax.get_position().y0 - 0.05,          
+                                        0.05,                          
+                                        ax.get_position().height + 0.125])     
+
+                cbar = fig.colorbar(cax, cax=cbar_ax, orientation='vertical')
+                cbar.ax.tick_params(labelsize=fontsize)
+                
+                ax2 = ax.twinx()
+
+                #prediction = arr_prob[init:end]
+
+                prediction = arr_prob[init:realEnd]  # Ajustar a realEnd
+                ax2.plot(np.arange(0, realEnd - init), prediction, linestyle='--', color='darkviolet', linewidth=4)
+                    
+                ax2.axhline(0.5, color='black', linewidth=1, linestyle='--')
+                ax2.set_ylim(0, 1)
+                ax2.tick_params(axis='y', labelsize=fontsize)
+
+                ax2.set_ylabel('Model outcome', fontsize=fontsize)
+                
+                legend = ax2.legend(['Model outcome', 'Threshold'], fontsize=fontsize, loc = 'lower left', bbox_to_anchor=(0.0, -0.0))
+                legend.get_frame().set_alpha(None)
+                legend.get_frame().set_facecolor((0, 0, 0, 0))
+                legend.get_frame().set_edgecolor('black')
+
+                #switch case of the ylabel depending on the grouping strategy
+                if self.strategyGrouping.value == StrategyGrouping.TIME.value:
+                    ylabel = 'Time'
+                    textName = 'TS-SHAP (Temporal)'
+                    nameColumns = self.nameInstants
+                elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
+                    ylabel = 'Feature'
+                    textName = 'TS-SHAP (Feature)'
+                    nameColumns = self.nameFeatures
+                elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
+                    ylabel = 'Process'
+                    textName = 'TS-SHAP (Process)'
+                    nameColumns = self.nameGroups
+
+                ax.set_ylabel(ylabel, fontsize=fontsize)
+                ax.set_title(textName, fontsize=fontsize)
+
+                ax.set_yticks(np.arange(self.numGroups))
+                ax.set_yticklabels(nameColumns, fontsize=fontsize)
+                
+                xticks = np.arange(0, segment.shape[1], 5)  
+                xlabels = np.arange(init, realEnd, 5)    
+
+                xticks = xticks[:len(xlabels)]             
+
+                ax.set_xticks(xticks)
+                ax.set_xticklabels(xlabels, fontsize=fontsize)
         
-        vmin, vmax = -0.5, 0.5
-        cmap = plt.get_cmap('bwr')
+            plt.tight_layout()
 
-        nSegments = (size + segmentSize - 1) // segmentSize
-        fig, axs = plt.subplots(nSegments, 1, figsize=(15, 25 * (max(10, self.numGroups)/36) * nSegments)) #15, 25 predictor
-        
-        if nSegments == 1:
-            axs = [axs]
-        
-        for n in range(nSegments):
-            if n == nSegments - 1:
-                arr_plot = np.hstack((arr_plot, np.zeros((self.numGroups, segmentSize - (size % segmentSize)))))
-                size = arr_plot.shape[1]
-            
-            ax = axs[n]
-            init = n * segmentSize
-            end = min((n + 1) * segmentSize, size)
-            segment = arr_plot[:, init:end]
-
-            ax.set_xlabel('Window', fontsize=fontsize)
-
-            cax = ax.imshow(segment, cmap=cmap, interpolation='nearest', vmin=vmin, vmax=vmax, aspect='auto')
-            
-                    # Crear un nuevo eje para la barra de color, asegurando que coincida con el tamaño del eje principal
-            cbar_ax = fig.add_axes([ax.get_position().x1 + 0.15,  # Posición horizontal (ligeramente a la derecha del eje)
-                                    ax.get_position().y0 - 0.05,          # Mismo comienzo vertical que el eje principal
-                                    0.05,                          # Ancho de la barra de color
-                                    ax.get_position().height + 0.125])     # Altura de la barra de color igual a la del eje principal
-
-            cbar = fig.colorbar(cax, cax=cbar_ax, orientation='vertical')
-            cbar.ax.tick_params(labelsize=fontsize)
-            
-            ax2 = ax.twinx()
-
-            prediction = arr_prob[init:end]
-
-            ax2.plot(np.arange(init, end), prediction, linestyle='--', color='darkviolet', linewidth=4)
-            
-            ax2.axhline(0.5, color='black', linewidth=1, linestyle='--')
-            ax2.set_ylim(0, 1)
-            ax2.tick_params(axis='y', labelsize=fontsize)
-
-            ax2.set_ylabel('Model outcome', fontsize=fontsize)
-            
-            legend = ax2.legend(['Model outcome', 'Threshold'], fontsize=fontsize, loc = 'lower left', bbox_to_anchor=(0.0, -0.0))
-            legend.get_frame().set_alpha(None)
-            legend.get_frame().set_facecolor((0, 0, 0, 0))
-            legend.get_frame().set_edgecolor('black')
-
-            #switch case of the ylabel depending on the grouping strategy
-            if self.strategyGrouping.value == StrategyGrouping.TIME.value:
-                ylabel = 'Time'
-                textName = 'TS-SHAP (Temporal)'
-                nameColumns = self.nameInstants
-            elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
-                ylabel = 'Feature'
-                textName = 'TS-SHAP (Feature)'
-                nameColumns = self.nameFeatures
-            elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
-                ylabel = 'Process'
-                textName = 'TS-SHAP (Process)'
-                nameColumns = self.nameGroups
-
-            ax.set_ylabel(ylabel, fontsize=fontsize)
-            ax.set_title(textName, fontsize=fontsize)
-
-            ax.set_yticks(np.arange(self.numGroups))
-            ax.set_yticklabels(nameColumns, fontsize=fontsize)
-
-            ax.set_xticks(np.arange(0, segment.shape[1], 5))
-            ax.set_xticklabels(np.arange(init, end, 5), fontsize=fontsize)
-        
-        plt.tight_layout()
-
-        if path is not None:
-            plt.savefig(path)
-        plt.show()
+            if path is not None:
+                plt.savefig(path)
+            plt.show()
