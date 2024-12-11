@@ -59,7 +59,6 @@ def generate_subsets(num_groups: int, num_subsets: int, strategy: StrategySubset
             subsets_to_generate = min(subsets_to_generate, math.comb(num_groups - 1, size))
 
             if strategy.value == StrategySubsets.EXACT.value:
-                #print("Exacto con iguall!!")
                 subsets_to_generate = math.comb(num_groups - 1, size)
 
             if subsets_to_generate == 0:

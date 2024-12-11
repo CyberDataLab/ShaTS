@@ -27,7 +27,6 @@ class TSSHAP:
                  classToExplain = -1
                  ):
         
-        print("He cambiado esto 55 veces")
         self.model = model
         self.supportDataset = supportDataset
         self.supportTensor = torch.stack([data['given'] for data in supportDataset]).to(device)
