@@ -50,8 +50,8 @@ Assume `model` is a pre-trained time series model and `supportDataset` contains 
 model = MyTrainedModel()
 supportDataset = [...]  # List of dictionaries with 'given' key containing tensors
 
-# Initialize TS-SHAP
-ts_shap = TSSHAP(
+# Initialize TSG-SHAP
+tsg_shap = TSGSHAP(
     model=model,
     supportDataset=supportDataset,
     strategyGrouping=StrategyGrouping.TIME,  # Options: TIME, FEATURE, MULTIFEATURE
@@ -67,16 +67,16 @@ ts_shap = TSSHAP(
 Pass a test dataset to compute Shapley values:
 ```python
 testDataset = [...]  # List of test samples
-tsshap_values = ts_shap.compute_tsshap(testDataset)
+tsshap_values = tsg_shap.compute_tsgshap(testDataset)
 ```
 
 ### 4. Visualize Results
 Use the visualization module to interpret the results:
 ```python
-ts_shap.visualize_tsshap(
-    shapley_values=tsshap_values, 
+tsg_shap.visualize_tsgshap(
+    shapley_values=tsgshap_values, 
     testDataset=testDataset,
-    path='results/tsshap_visualization.png'
+    path='results/tsgshap_visualization.png'
 )
 ```
 
