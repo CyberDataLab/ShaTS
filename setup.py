@@ -1,22 +1,21 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="ts_shap",
-    version="0.4.1",
+    name="tsg_shap",
+    version="0.5.0",
     packages=find_packages(),
     install_requires=[
         "torch",
         "pandas",
         "numpy",
         "matplotlib",
-        "math",
     ],
     author="Manuel Franco de la Peña",
     author_email="manuel.francop@um.es",
-    description="Paquete para usar TS-SHAP",
+    description="Package TSG-SHAP",
     long_description=open('README.md').read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/ManuelFranco/TS-SHAP",
+    url="https://github.com/ManuelFranco/TSG-SHAP",
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",

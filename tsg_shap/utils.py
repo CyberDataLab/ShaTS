@@ -1,8 +1,7 @@
-from itertools import combinations
 import math
 import random
 from enum import Enum
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
 
 class StrategySubsets(Enum):
@@ -14,14 +13,13 @@ class StrategyGrouping(Enum):
     """Enum representing the strategy for grouping."""
     TIME = 1
     FEATURE = 2
-    PROCESS = 3
+    MULTIFEATURE = 3
 
 class StrategyPrediction(Enum):
     ONECLASS = 1
     MULTICLASS = 2
 
 
-## FUNCION ACTUALIZADA
 def generate_subsets(num_groups: int, num_subsets: int, strategy: StrategySubsets = StrategySubsets.APPROX_MK) -> Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:
     """
     Generate subsets for a given number of groups and a specified strategy.

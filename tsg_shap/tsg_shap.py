@@ -1,14 +1,12 @@
 # my_shap_package/ts_shap.py
 import torch
-import pandas as pd
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from enum import Enum
 from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generate_subsets
 
 
-class TSSHAP:
+class TSG_SHAP:
     def __init__(self, 
                  model, 
                  supportDataset, 
@@ -60,9 +58,9 @@ class TSSHAP:
             self.numGroups = self.windowSize
         elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
             self.numGroups = self.numFeatures
-        elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
+        elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
             if not self.customGroups:
-                raise ValueError("Custom groups are required for PROCESS strategy.")
+                raise ValueError("Custom groups are required for MULTIFEATURE strategy.")
             self.numGroups = len(self.customGroups)
         
         self.nameFeatures = nameFeatures or [f'feature{i+1}' for i in range(self.numFeatures)]
@@ -116,9 +114,10 @@ class TSSHAP:
                     data_tensor[:, instant, indexes] = self.supportTensor[:, instant, indexes].clone()
                 modified_data_batches.append(data_tensor.clone())
         
-        elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
+        elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
             for subset in self.all_subsets:
                 data_tensor = data['given'].unsqueeze(0).expand(len(self.supportDataset), *data['given'].shape).clone().to(self.device)
+                
                 indexes = [self.customGroups[group] for group in subset]
                 for instant in range(self.windowSize):
                     for group_indexes in indexes:
@@ -154,14 +153,14 @@ class TSSHAP:
         return prob_with, prob_without
 
     
-    def compute_tsshap(self, testDataset):
-        tsshapvalues_list = torch.zeros(len(testDataset), self.numGroups, device=self.device)
+    def compute_tsgshap(self, testDataset):
+        tsgshapvalues_list = torch.zeros(len(testDataset), self.numGroups, device=self.device)
 
         with torch.no_grad():
 
             for idx in range(len(testDataset)):
                 data = testDataset[idx]
-                tsshapvalues = torch.zeros(self.numGroups, device=self.device)
+                tsgshapvalues = torch.zeros(self.numGroups, device=self.device)
 
                 pred_original, class_original, prob_original = self._getPrediction(data)
 
@@ -172,17 +171,17 @@ class TSSHAP:
                 for group in range(self.numGroups):
                     for size in range(self.numGroups):
                         prob_with, prob_without = self._computeDifferences(probs, group, size)
-                        tsshapvalues[group] += (prob_without - prob_with).mean()
+                        tsgshapvalues[group] += (prob_without - prob_with).mean()
 
-                tsshapvalues_list[idx] = tsshapvalues.clone()
+                tsgshapvalues_list[idx] = tsgshapvalues.clone()
 
                 #free memory
-                del modified_data_batches, probs, pred_original, class_original, prob_original, tsshapvalues
+                del modified_data_batches, probs, pred_original, class_original, prob_original, tsgshapvalues
                 torch.cuda.empty_cache()
         
-        return tsshapvalues_list
+        return tsgshapvalues_list
         
-    def visualize_tsshap(self, 
+    def plot_tsgshap(self, 
                         shapley_values, 
                         testDataset = None, 
                         model_predictions = None, 
@@ -260,15 +259,15 @@ class TSSHAP:
                 #switch case of the ylabel depending on the grouping strategy
                 if self.strategyGrouping.value == StrategyGrouping.TIME.value:
                     ylabel = 'Time'
-                    textName = 'TS-SHAP (Temporal)'
+                    textName = 'TSG-SHAP (Temporal)'
                     nameColumns = self.nameInstants
                 elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
                     ylabel = 'Feature'
-                    textName = 'TS-SHAP (Feature)'
+                    textName = 'TSG-SHAP (Feature)'
                     nameColumns = self.nameFeatures
-                elif self.strategyGrouping.value == StrategyGrouping.PROCESS.value:
-                    ylabel = 'Process'
-                    textName = 'TS-SHAP (Process)'
+                elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
+                    ylabel = 'MULTIFEATURE'
+                    textName = 'TSG-SHAP (MULTIFEATURE)'
                     nameColumns = self.nameGroups
 
                 ax.set_ylabel(ylabel, fontsize=fontsize)
