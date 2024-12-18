@@ -1,17 +1,17 @@
-# TSG-SHAP: Interpretability for Time Series Models
+# TSG_SHAP: A Shapley-Based Interpretability Method for Time Series Machine Learning Models
 
 ## Overview
-TSG-SHAP is a Shapley-based interpretability method specifically designed for **time series Machine Learning models**. Unlike traditional Shapley methods, TS-SHAP applies **a priori feature grouping strategies** to preserve temporal relationships and improve explanation quality.
+TSG_SHAP is a Shapley-based interpretability method specifically designed for **time series Machine Learning models**. Unlike traditional Shapley methods, TSG_SHAP applies **a priori feature grouping strategies** to preserve temporal relationships and improve explanation quality.
 
 This repository includes:
-- The **TSG-SHAP library**, a plug-and-play Python module.
-- Example Jupyter Notebook (`example.ipynb`) demonstrating the usage of TSG-SHAP on a real-world dataset.
+- The **TSG_SHAP library**, a plug-and-play Python module.
+- Example Jupyter Notebook (`example.ipynb`) demonstrating the usage of TSG_SHAP on a real-world dataset.
 
 ---
 
 ## Features
 1. **Model Agnostic**: TSG-SHAP can be applied to any time series Machine Learning model.
-2. **Feature Grouping**:
+2. **Grouping Strategy**:
    - **Temporal Grouping**: Grouping features by time instants.
    - **Feature Grouping**: Grouping measurements by features.
    - **Multi-Feature Grouping**: Custom groupings for logical units (e.g., industrial processes).
@@ -35,11 +35,11 @@ pip install -r requirements.txt
 ---
 
 ## Quick Start
-The `example.ipynb` file provides a step-by-step guide on using TSG-SHAP. Below is a quick example:
+The `example.ipynb` file provides a step-by-step guide on using TSG_SHAP. Below is a quick example:
 
-### 1. Import TS-SHAP
+### 1. Import TSG_SHAP
 ```python
-from tsg_shap import TSGSHAP
+from tsg_shap import TSG_SHAP
 from tsg_shap.utils import StrategyGrouping, StrategyPrediction
 ```
 
@@ -50,8 +50,8 @@ Assume `model` is a pre-trained time series model and `supportDataset` contains 
 model = MyTrainedModel()
 supportDataset = [...]  # List of dictionaries with 'given' key containing tensors
 
-# Initialize TSG-SHAP
-tsg_shap = TSGSHAP(
+# Initialize TSG_SHAP
+tsg_shap = TSG_SHAP(
     model=model,
     supportDataset=supportDataset,
     strategyGrouping=StrategyGrouping.TIME,  # Options: TIME, FEATURE, MULTIFEATURE
@@ -67,7 +67,7 @@ tsg_shap = TSGSHAP(
 Pass a test dataset to compute Shapley values:
 ```python
 testDataset = [...]  # List of test samples
-tsshap_values = tsg_shap.compute_tsgshap(testDataset)
+tsgshap_values = tsg_shap.compute_tsgshap(testDataset)
 ```
 
 ### 4. Visualize Results
@@ -89,7 +89,7 @@ The repository is organized as follows:
 .
 ├── tsg_shap
 │   ├── __init__.py          # Module initialization
-│   ├── tsg_shap.py          # TSGSHAP class implementation
+│   ├── tsg_shap.py          # TSG_SHAP class implementation
 │   └── utils.py             # Utility functions and strategy enums
 ├── example.ipynb            # Usage example notebook
 ├── requirements.txt         # Dependencies
@@ -106,14 +106,14 @@ The repository is organized as follows:
 ---
 
 ## Visualization
-TS-SHAP provides intuitive visualizations to analyze feature contributions over time:
+TSG_SHAP provides intuitive visualizations to analyze feature contributions over time:
 - Heatmaps: Represent contributions with **red** (positive influence) and **blue** (negative influence).
 - Output Probability: Overlaid line showing model predictions.
 
 ---
 
 ## Example Dataset
-The example notebook uses the [SWaT dataset](https://itrust.sutd.edu.sg/itrust-labs_datasets/) as a demonstration of TSG-SHAP applied to Anomaly Detection in an Industrial Control System.
+The example notebook uses the [SWaT dataset](https://itrust.sutd.edu.sg/itrust-labs_datasets/) as a demonstration of TSG_SHAP applied to Anomaly Detection in an Industrial Control System.
 
 ---
 
