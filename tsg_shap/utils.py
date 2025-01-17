@@ -19,6 +19,9 @@ class StrategyPrediction(Enum):
     ONECLASS = 1
     MULTICLASS = 2
 
+class StrategyValue(Enum):
+    INDEPENDENT = 1
+    DEPENDENT = 2
 
 def generate_subsets(num_groups: int, num_subsets: int, strategy: StrategySubsets = StrategySubsets.APPROX_MK) -> Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:
     """

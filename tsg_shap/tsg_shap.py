@@ -3,7 +3,7 @@ import torch
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generate_subsets
+from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, StrategyValue, generate_subsets
 
 
 class TSG_SHAP:
@@ -13,7 +13,9 @@ class TSG_SHAP:
                  strategySubsets=StrategySubsets.APPROX_MK,
                  strategyGrouping=StrategyGrouping.TIME,
                  strategyPrediction=StrategyPrediction.MULTICLASS,
-                 m = 5, 
+                 strategyValue=StrategyValue.INDEPENDENT,
+                 m = 5,
+                 kClusters = 10,
                  batch_size=32, 
                  customGroups=None,
                  device= torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -33,6 +35,7 @@ class TSG_SHAP:
         self.strategySubsets = strategySubsets
         self.strategyGrouping = strategyGrouping
         self.strategyPrediction = strategyPrediction
+        self.strategyValue = strategyValue
         self.customGroups = customGroups
         self.device = device
         self.m = m
@@ -48,9 +51,9 @@ class TSG_SHAP:
         self.pair_dicts = {(subset, entity): i for i, (subset, entity) in enumerate(self.keys_support_subsets)}
 
         self.coef_dict = self._generate_coef_dict()
-        
-
         self.mean_prediction = self._compute_mean_prediction()
+        if self.strategyValue.value == StrategyValue.DEPENDENT.value:
+            self.kcentroids, self.klabels = self.compute_kmeans(n_clusters=kClusters)
 
 
     def _initialize_groups(self, nameFeatures, nameGroups, nameInstants):
@@ -137,19 +140,45 @@ class TSG_SHAP:
             
         return torch.tensor(probs, device=self.device)
 
-    def _computeDifferences(self, probs, instant, size):
+    def _computeDifferences(self, probs, instant, size, weights_dict):
 
         subsets_with, subsets_without = self.subsets_dict[(instant, size)]
         prob_with = torch.zeros(len(subsets_with), device=self.device)
         prob_without = torch.zeros(len(subsets_without), device=self.device)
 
+        if self.strategyValue.value == StrategyValue.INDEPENDENT.value:
+            for i, (s_with, s_without) in enumerate(zip(subsets_with, subsets_without)):
+                indexes_with = [self.pair_dicts[(tuple(s_with), entity)] for entity in range(len(self.supportDataset))]
+                indexes_without = [self.pair_dicts[(tuple(s_without), entity)] for entity in range(len(self.supportDataset))]
+                coef = self.coef_dict[len(s_without)]
+                prob_with[i] = probs[indexes_with].mean() * coef 
+                prob_without[i] = probs[indexes_without].mean() * coef
+            
+            return prob_with, prob_without
+        
+        ################# 13.6
+        # Precompute weights for all subsets
+        weights_with_all = torch.stack([torch.tensor([weights_dict[tuple(subset)][self.klabels[s]] for s in range(len(self.supportDataset))], device=self.device) for subset in subsets_with])
+        weights_without_all = torch.stack([torch.tensor([weights_dict[tuple(subset)][self.klabels[s]] for s in range(len(self.supportDataset))], device=self.device) for subset in subsets_without])
+
         for i, (s_with, s_without) in enumerate(zip(subsets_with, subsets_without)):
             indexes_with = [self.pair_dicts[(tuple(s_with), entity)] for entity in range(len(self.supportDataset))]
             indexes_without = [self.pair_dicts[(tuple(s_without), entity)] for entity in range(len(self.supportDataset))]
             coef = self.coef_dict[len(s_without)]
-            prob_with[i] = probs[indexes_with].mean() * coef 
-            prob_without[i] = probs[indexes_without].mean() * coef
-        
+
+            # Vectorized probability computation
+            probs_with_precomputed = probs[indexes_with]
+            probs_without_precomputed = probs[indexes_without]
+
+            weights_with_support = weights_with_all[i]
+            weights_without_support = weights_without_all[i]
+
+            # Compute weighted probabilities
+            prob_with[i] = (probs_with_precomputed * weights_with_support).sum() / weights_with_support.sum() * coef
+            prob_without[i] = (probs_without_precomputed * weights_without_support).sum() / weights_without_support.sum() * coef
+
+        #print(prob_with, prob_without)
+
         return prob_with, prob_without
 
     
@@ -160,6 +189,13 @@ class TSG_SHAP:
 
             for idx in range(len(testDataset)):
                 data = testDataset[idx]
+                weights_dict = None
+                if self.strategyValue.value == StrategyValue.DEPENDENT.value:
+                    weights_dict = {
+                        tuple(subset): self._compute_instance_weights(data, tuple(subset))
+                        for subset in self.all_subsets
+                    }
+                
                 tsgshapvalues = torch.zeros(self.numGroups, device=self.device)
 
                 pred_original, class_original, prob_original = self._getPrediction(data)
@@ -170,7 +206,7 @@ class TSG_SHAP:
 
                 for group in range(self.numGroups):
                     for size in range(self.numGroups):
-                        prob_with, prob_without = self._computeDifferences(probs, group, size)
+                        prob_with, prob_without = self._computeDifferences(probs, group, size, weights_dict)
                         tsgshapvalues[group] += (prob_without - prob_with).mean()
 
                 tsgshapvalues_list[idx] = tsgshapvalues.clone()
@@ -289,3 +325,84 @@ class TSG_SHAP:
             if path is not None:
                 plt.savefig(path)
             plt.show()
+
+    def compute_kmeans(self, n_clusters=3, max_iters=100):
+        """
+        Perform k-means clustering on the support dataset using PyTorch.
+
+        Args:
+            n_clusters: Number of clusters for k-means.
+            max_iters: Maximum number of iterations.
+
+        Returns:
+            cluster_centers: Tensor of cluster centers.
+            labels: Tensor of cluster assignments for each instance.
+        """
+        data = self.supportTensor.view(len(self.supportDataset), -1)  # Flatten support data
+        cluster_centers = data[torch.randperm(len(data))[:n_clusters]]  # Initialize centers randomly
+
+        for _ in range(max_iters):
+            # Compute distances and assign clusters
+            distances = torch.cdist(data, cluster_centers)
+            labels = torch.argmin(distances, dim=1)
+
+            # Update cluster centers
+            new_centers = torch.stack([data[labels == k].mean(dim=0) for k in range(n_clusters)])
+
+            # Check for convergence
+            if torch.allclose(cluster_centers, new_centers, atol=1e-4):
+                break
+
+            cluster_centers = new_centers
+        
+        #redimensioning the cluster_centers
+        cluster_centers = cluster_centers.view(n_clusters, self.windowSize, self.numFeatures)
+
+        return cluster_centers, labels
+    
+    def _compute_instance_weights(self, instance, subset, sigma=0.1):
+        """
+        Compute weights for the given instance based on its distance to the centroids.
+        
+        Args:
+            instance: Tensor with the instance to explain.
+            subset: Indices representing the subset to modify.
+            sigma: Bandwidth parameter for the Gaussian kernel.
+
+        Returns:
+            Tensor of normalized weights for the centroids.
+        """
+
+        # Expand the instance to match the number of centroids
+        instance_modified = instance['given'].unsqueeze(0).expand(len(self.kcentroids), *instance['given'].shape).clone().to(self.device)
+
+        # Modify the instance based on the grouping strategy and centroids
+        if self.strategyGrouping.value == StrategyGrouping.TIME.value:
+            indexes = torch.tensor(list(subset), dtype=torch.long, device=self.device)
+            instance_modified[:, indexes, :] = self.kcentroids[:, indexes, :].clone()
+
+        elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
+            indexes = torch.tensor(list(subset), dtype=torch.long, device=self.device)
+            for instant in range(self.windowSize):
+                instance_modified[:, instant, indexes] = self.kcentroids[:, instant, indexes].clone()
+
+        elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
+            indexes = [self.customGroups[group] for group in subset]
+            for instant in range(self.windowSize):
+                for group_indexes in indexes:
+                    instance_modified[:, instant, group_indexes] = self.kcentroids[:, instant, group_indexes].clone()
+
+        # Calculate distances from the modified instance to each centroid
+        distances = torch.norm(self.kcentroids - instance_modified, dim=(1, 2))
+
+        #normalize distances
+        if distances.max() == distances.min():
+            return torch.ones(len(self.kcentroids), device=self.device) 
+        
+        distances = (distances - distances.min()) / (distances.max() - distances.min())
+
+        # Compute weights using a Gaussian kernel
+        weights = torch.exp(-distances**2 / (2 * sigma**2))
+        
+        # Normalize weights to sum to 1
+        return weights / weights.sum()
