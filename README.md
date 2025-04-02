@@ -1,11 +1,16 @@
-# TSG_SHAP: A Shapley-Based Interpretability Method for Time Series Machine Learning Models
+# ShaTS: Shapley values for Time Series ML/DL Models
+
+<div align='center'>
+<img src="ShaTSLogo.png" alt="ShaTS logo" width="200"/>
+</div>
+
 
 ## Overview
-TSG_SHAP is a Shapley-based interpretability method specifically designed for **time series Machine Learning models**. Unlike traditional Shapley methods, TSG_SHAP applies **a priori feature grouping strategies** to preserve temporal relationships and improve explanation quality.
+ShaTS is a Shapley-based interpretability method specifically designed for **time series Machine Learning models**. Unlike traditional Shapley methods, ShaTS applies **a priori feature grouping strategies** to preserve temporal relationships and improve explanation quality.
 
 This repository includes:
-- The **TSG_SHAP library**, a plug-and-play Python module.
-- Example Jupyter Notebook (`example.ipynb`) demonstrating the usage of TSG_SHAP on a real-world dataset.
+- The **ShaTS library**, a plug-and-play Python module.
+- Example Jupyter Notebook (`example.ipynb`) demonstrating the usage of ShaTS on a real-world dataset.
 
 ---
 
@@ -35,11 +40,11 @@ pip install -r requirements.txt
 ---
 
 ## Quick Start
-The `example.ipynb` file provides a step-by-step guide on using TSG_SHAP. Below is a quick example:
+The `example.ipynb` file provides a step-by-step guide on using ShaTS. Below is a quick example:
 
-### 1. Import TSG_SHAP
+### 1. Import ShaTS
 ```python
-from tsg_shap import TSG_SHAP
+from tsg_shap import ShaTS
 from tsg_shap.utils import StrategyGrouping, StrategyPrediction
 ```
 
@@ -51,7 +56,7 @@ model = MyTrainedModel()
 supportDataset = [...]  # List of dictionaries with 'given' key containing tensors
 
 # Initialize TSG_SHAP
-tsg_shap = TSG_SHAP(
+shaTS = ShaTS(
     model=model,
     supportDataset=supportDataset,
     strategyGrouping=StrategyGrouping.TIME,  # Options: TIME, FEATURE, MULTIFEATURE
@@ -67,13 +72,13 @@ tsg_shap = TSG_SHAP(
 Pass a test dataset to compute Shapley values:
 ```python
 testDataset = [...]  # List of test samples
-tsgshap_values = tsg_shap.compute_tsgshap(testDataset)
+tsgshap_values = shaTS.compute_tsgshap(testDataset)
 ```
 
 ### 4. Visualize Results
 Use the visualization module to interpret the results:
 ```python
-tsg_shap.visualize_tsgshap(
+shaTS.visualize_tsgshap(
     shapley_values=tsgshap_values, 
     testDataset=testDataset,
     path='results/tsgshap_visualization.png'
@@ -106,21 +111,21 @@ The repository is organized as follows:
 ---
 
 ## Visualization
-TSG_SHAP provides intuitive visualizations to analyze feature contributions over time:
+ShaTS provides intuitive visualizations to analyze feature contributions over time:
 - Heatmaps: Represent contributions with **red** (positive influence) and **blue** (negative influence).
 - Output Probability: Overlaid line showing model predictions.
 
 ---
 
 ## Example Dataset
-The example notebook uses the [SWaT dataset](https://itrust.sutd.edu.sg/itrust-labs_datasets/) as a demonstration of TSG_SHAP applied to Anomaly Detection in an Industrial Control System.
+The example notebook uses the [SWaT dataset](https://itrust.sutd.edu.sg/itrust-labs_datasets/) as a demonstration of ShaTS applied to Anomaly Detection in an Industrial Control System.
 
 ---
 
 ## Citation
 If you use TSG-SHAP in your research, please cite:
 
-> Franco de la Peña, M., Perales Gómez, A.L., Fernández Maimó, L. *TSG-SHAP: A Shapley-Based Interpretability Method for Time Series Machine Learning Models Applied to Anomaly Detection*. Preprint.
+> Franco de la Peña, M., Perales Gómez, A.L., Fernández Maimó, L. *ShaTS: A Shapley-Based Interpretability Method for Time Series Machine Learning Models Applied to Anomaly Detection*.
 
 ---
 

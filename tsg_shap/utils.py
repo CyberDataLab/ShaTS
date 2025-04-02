@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 class StrategySubsets(Enum):
     """Enum representing the strategy for generating subsets."""
     EXACT = 1
-    APPROX_MK = 2
+    APPROX = 2
 
 class StrategyGrouping(Enum):
     """Enum representing the strategy for grouping."""
@@ -19,20 +19,17 @@ class StrategyPrediction(Enum):
     ONECLASS = 1
     MULTICLASS = 2
 
-class StrategyValue(Enum):
-    INDEPENDENT = 1
-    DEPENDENT = 2
 
-def generate_subsets(num_groups: int, num_subsets: int, strategy: StrategySubsets = StrategySubsets.APPROX_MK) -> Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:
+def generateSubsets(nGroups: int, nSubsets: int, strategy: StrategySubsets = StrategySubsets.APPROX) -> Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:
     """
     Generate subsets for a given number of groups and a specified strategy.
 
     Args:
-        num_groups (int): Number of groups.
-        num_subsets (int): Number of subsets to generate for each group and size.
+        nGroups (int): Number of groups.
+        nSubsets (int): Number of subsets to generate for each group and size.
         strategy (StrategySubsets): Strategy for subset generation. Options are:
             - StrategySubsets.EXACT: Generate all possible subsets of each size for each group.
-            - StrategySubsets.APPROX_MK: Generate approximately `num_subsets` subsets for each size per group.
+            - StrategySubsets.APPROX: Generate approximately `nSubsets` subsets for each size per group.
 
     Returns:
         Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:
@@ -44,77 +41,77 @@ def generate_subsets(num_groups: int, num_subsets: int, strategy: StrategySubset
     Raises:
         ValueError: If the number of groups is less than 1 or the number of subsets is negative.
     """
-    if num_groups < 1:
-        raise ValueError("num_groups must be at least 1.")
-    if num_subsets < 0:
-        raise ValueError("num_subsets must be non-negative.")
+    if nGroups < 1:
+        raise ValueError("nGroups must be at least 1.")
+    if nSubsets < 0:
+        raise ValueError("nSubsets must be non-negative.")
 
-    all_subsets = [set() for _ in range(num_groups + 1)]
-    subset_dict = {}
+    allSubsets = [set() for _ in range(nGroups + 1)]
+    subsetDict = {}
 
-    for group in range(num_groups):
-        for size in range(num_groups):
+    for group in range(nGroups):
+        for size in range(nGroups):
             # Calculate the number of subsets to generate
-            subsets_to_generate = math.floor(num_subsets * (size + 1)**(2/3) / 
-                                             sum([(k + 1)**(2/3) for k in range(num_groups)]))
-            subsets_to_generate = min(subsets_to_generate, math.comb(num_groups - 1, size))
+            nSubsetsToGenerate = math.floor(nSubsets * (size + 1)**(2/3) / 
+                                             sum([(k + 1)**(2/3) for k in range(nGroups)]))
+            nSubsetsToGenerate = min(nSubsetsToGenerate, math.comb(nGroups - 1, size))
 
             if strategy.value == StrategySubsets.EXACT.value:
-                subsets_to_generate = math.comb(num_groups - 1, size)
+                nSubsetsToGenerate = math.comb(nGroups - 1, size)
 
-            if subsets_to_generate == 0:
-                subsets_to_generate = 1
+            if nSubsetsToGenerate == 0:
+                nSubsetsToGenerate = 1
 
             # Generate subsets
-            subsets_without_group = [subset for subset in all_subsets[size] if group not in subset]
-            subsets_with_group = [tuple(sorted(subset + (group,))) for subset in subsets_without_group]
+            subsetsWithoutGroup = [subset for subset in allSubsets[size] if group not in subset]
+            subsetsWithGroup = [tuple(sorted(subset + (group,))) for subset in subsetsWithoutGroup]
 
-            remaining_numbers = list(range(num_groups))
-            remaining_numbers.remove(group)
+            remainingNumbers = list(range(nGroups))
+            remainingNumbers.remove(group)
 
             # Avoid duplicates by maintaining intersections
             intersection = []
-            for i, subset in enumerate(subsets_without_group):
-                if subsets_with_group[i] in all_subsets[size + 1]:
+            for i, subset in enumerate(subsetsWithoutGroup):
+                if subsetsWithGroup[i] in allSubsets[size + 1]:
                     intersection.append(subset)
 
-            subsets_without_group = sorted(
-                subsets_without_group,
+            subsetsWithoutGroup = sorted(
+                subsetsWithoutGroup,
                 key=lambda x: x in intersection,
                 reverse=False
             )
-            subsets_with_group = sorted(
-                subsets_with_group,
+            subsetsWithGroup = sorted(
+                subsetsWithGroup,
                 key=lambda x: x in intersection,
                 reverse=False
             )
 
-            while len(subsets_without_group) < subsets_to_generate:
-                random_subset_without = tuple(sorted(random.sample(remaining_numbers, size)))
-                random_subset_with = tuple(sorted(random_subset_without + (group,)))
+            while len(subsetsWithoutGroup) < nSubsetsToGenerate:
+                randomSubsetWithout = tuple(sorted(random.sample(remainingNumbers, size)))
+                randomSubsetWith = tuple(sorted(randomSubsetWithout + (group,)))
 
-                if random_subset_without not in all_subsets[size]:
-                    all_subsets[size].add(random_subset_without)
-                    subsets_without_group.append(random_subset_without)
-                    subsets_with_group.append(random_subset_with)
+                if randomSubsetWithout not in allSubsets[size]:
+                    allSubsets[size].add(randomSubsetWithout)
+                    subsetsWithoutGroup.append(randomSubsetWithout)
+                    subsetsWithGroup.append(randomSubsetWith)
 
-                if random_subset_with not in all_subsets[size + 1]:
-                    all_subsets[size + 1].add(random_subset_with)
+                if randomSubsetWith not in allSubsets[size + 1]:
+                    allSubsets[size + 1].add(randomSubsetWith)
 
-            subsets_with_group = subsets_with_group[:subsets_to_generate]
+            subsetsWithGroup = subsetsWithGroup[:nSubsetsToGenerate]
 
-            for subset in subsets_with_group:
-                if subset not in all_subsets[size + 1]:
-                    all_subsets[size + 1].add(subset)
+            for subset in subsetsWithGroup:
+                if subset not in allSubsets[size + 1]:
+                    allSubsets[size + 1].add(subset)
 
-            subsets_without_group = subsets_without_group[:subsets_to_generate]
-            subset_dict[(group, size)] = (
-                [list(subset) for subset in subsets_with_group],
-                [list(subset) for subset in subsets_without_group]
+            subsetsWithoutGroup = subsetsWithoutGroup[:nSubsetsToGenerate]
+            subsetDict[(group, size)] = (
+                [list(subset) for subset in subsetsWithGroup],
+                [list(subset) for subset in subsetsWithoutGroup]
             )
 
     # Flatten all subsets
-    flattened_subsets = [list(subset) for size_subsets in all_subsets for subset in size_subsets]
+    flatennedSubsets = [list(subset) for sizeSubsets in allSubsets for subset in sizeSubsets]
 
-    return subset_dict, flattened_subsets
+    return subsetDict, flatennedSubsets
 
