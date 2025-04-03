@@ -1,4 +1,11 @@
+# Python
 build/
 *.egg-info/
 __pycache__/
+.venv
+
+# IDEs
+.vscode
+
+# Data
 experiments/

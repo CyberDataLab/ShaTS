@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 setup(
     name="tsg_shap",
@@ -13,12 +13,12 @@ setup(
     author="Manuel Franco de la Peña",
     author_email="manuel.francop@um.es",
     description="Package TSG-SHAP",
-    long_description=open('README.md').read(),
+    long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/ManuelFranco/TSG-SHAP",
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.6',
+    python_requires=">=3.12",
 )

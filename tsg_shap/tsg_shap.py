@@ -1,195 +1,285 @@
-import torch
 import math
-import numpy as np
+from pathlib import Path
+from typing import Any, TypedDict
+
 import matplotlib.pyplot as plt
-from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generateSubsets, estimate_m
+import numpy as np
+import torch
+from torch import Tensor
+from torch.nn import Module
+
+from tsg_shap.grouping import AbstractGroupingStrategy
+
+from .utils import StrategyPrediction, StrategySubsets, estimate_m, generate_subsets
+
+
+class SupportDatasetItem(TypedDict):
+    given: Tensor
+    answer: Tensor
+    label: Tensor
 
 
 class ShaTS:
-    def __init__(self, 
-                 model, 
-                 supportDataset, 
-                 strategySubsets=StrategySubsets.APPROX,
-                 strategyGrouping=StrategyGrouping.TIME,
-                 strategyPrediction=StrategyPrediction.MULTICLASS,
-                 m = 5,
-                 batchSize=32, 
-                 customGroups=None,
-                 device= torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                 nameFeatures = None,
-                 nameGroups = None,
-                 nameInstants = None,
-                 verbose = 0,
-                 nclass = 2,
-                 classToExplain = -1
-                 ):
-        
+    def __init__(
+        self,
+        model: Module,
+        support_dataset: list[SupportDatasetItem],
+        grouping_strategy: AbstractGroupingStrategy,
+        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
+        prediction_strategy: StrategyPrediction = StrategyPrediction.MULTICLASS,
+        m: int = 5,
+        batch_size: int = 32,
+        custom_groups: list[list[int]] | None = None,
+        device: str | torch.device | int = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ),
+        nclass: int = 2,
+        class_to_explain: int = -1,
+    ):
+
         self.model = model
-        self.supportDataset = supportDataset
-        self.supportTensor = torch.stack([data['given'] for data in supportDataset]).to(device)
-        self.windowSize = supportDataset[0]['given'].shape[0]
-        self.numFeatures = supportDataset[0]['given'].shape[1]
-        self.strategySubsets = strategySubsets
-        self.strategyGrouping = strategyGrouping
-        self.strategyPrediction = strategyPrediction
-        self.customGroups = customGroups
+        self.support_dataset = support_dataset
+        self.support_tensor = torch.stack(
+            [data["given"] for data in support_dataset]
+        ).to(device)
+        self.window_size = support_dataset[0]["given"].shape[0]
+        self.num_of_features = support_dataset[0]["given"].shape[1]
+        self.subsets_generation_strategy = subsets_generation_strategy
+        self.grouping_strategy = grouping_strategy
+        self.prediction_strategy = prediction_strategy
+        self.custom_groups = custom_groups
         self.device = device
-        self.batchSize = batchSize
-        self.verbose = verbose
+        self.batch_size = batch_size
         self.nclass = nclass
-        self.classToExplain = classToExplain
+        self.class_to_explain = class_to_explain
 
-        self._initializeGroups(nameFeatures, nameGroups, nameInstants)
-        self.m = estimate_m(self.numGroups, m)
+        self.m = estimate_m(self.groups_num, m)
 
-        
-        self.subsets_dict, self.allSubsets = generateSubsets(self.numGroups, self.m, self.strategySubsets)
-        self.keysSupportSubsets = [(tuple(subset), entity) for subset in self.allSubsets for entity in range(len(self.supportDataset))]
-        self.pairDicts = {(subset, entity): i for i, (subset, entity) in enumerate(self.keysSupportSubsets)}
+        self.subsets_dict, self.all_subsets = generate_subsets(
+            self.groups_num, self.m, self.subsets_generation_strategy
+        )
 
-        self.coefDict = self._generateCoefDict()
-        self.meanPrediction = self._computeMeanPrediction()
+        keys_support_subsets = [
+            (tuple(subset), entity)
+            for subset in self.all_subsets
+            for entity in range(len(self.support_dataset))
+        ]
+        self.pair_dicts = {
+            (subset, entity): i
+            for i, (subset, entity) in enumerate(keys_support_subsets)
+        }
 
+        self.coefficients_dict = self._generate_coefficients_dict()
+        self.mean_prediction = self._compute_mean_prediction()
 
-    def _initializeGroups(self, nameFeatures, nameGroups, nameInstants):
-        if self.strategyGrouping.value == StrategyGrouping.TIME.value:
-            self.numGroups = self.windowSize
-        elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
-            self.numGroups = self.numFeatures
-        elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
-            if not self.customGroups:
-                raise ValueError("Custom groups are required for MULTIFEATURE strategy.")
-            self.numGroups = len(self.customGroups)
-        
-        self.nameFeatures = nameFeatures or [f'feature{i+1}' for i in range(self.numFeatures)]
-        self.nameInstants = nameInstants or [f'instant{i+1}' for i in range(self.windowSize)]
-        self.nameGroups = nameGroups or [f'group{i+1}' for i in range(self.numGroups)]
+    @property
+    def groups_num(self) -> int:
+        return self.grouping_strategy.groups_num
 
-    def _generateCoefDict(self):
-        coefDict = {}
-        if self.strategySubsets.value == StrategySubsets.EXACT.value:
-            for i in range(self.numGroups):
-                coefDict[i] = math.factorial(i) * math.factorial(self.numGroups - i - 1) / math.factorial(self.numGroups)
+    def _generate_coefficients_dict(self) -> dict[int, float]:
+        coef_dict = dict[int, float]()
+        if self.subsets_generation_strategy.value == StrategySubsets.EXACT.value:
+            for i in range(self.groups_num):
+                coef_dict[i] = (
+                    math.factorial(i)
+                    * math.factorial(self.groups_num - i - 1)
+                    / math.factorial(self.groups_num)
+                )
         else:
-            for i in range(self.numGroups):
-                coefDict[i] = 1 / self.numGroups
-        return coefDict
+            for i in range(self.groups_num):
+                coef_dict[i] = 1 / self.groups_num
+        return coef_dict
 
-    def _computeMeanPrediction(self):
-        meanPrediction = torch.zeros(self.nclass, device=self.device)
+    def _compute_mean_prediction(self) -> Tensor:
+        mean_prediction = torch.zeros(self.nclass, device=self.device)
         with torch.no_grad():
-            for i in range(0, len(self.supportDataset), self.batchSize):
-                batch = self.supportDataset[i:i + self.batchSize]
-                batch_tensor = torch.stack([data['given'] for data in batch]).to(self.device)
-                meanPrediction += torch.sum(torch.softmax(self.model(batch_tensor), dim=1), dim=0) if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sum(torch.sigmoid(self.model(batch_tensor)), dim=0)
-        return meanPrediction / len(self.supportDataset)
-    
-    def _getPrediction(self, data):
+            for i in range(0, len(self.support_dataset), self.batch_size):
+                batch = self.support_dataset[i : i + self.batch_size]
+                batch_tensor = torch.stack([data["given"] for data in batch]).to(
+                    self.device
+                )
+                mean_prediction += (
+                    torch.sum(torch.softmax(self.model(batch_tensor), dim=1), dim=0)
+                    if self.prediction_strategy.value
+                    == StrategyPrediction.MULTICLASS.value
+                    else torch.sum(torch.sigmoid(self.model(batch_tensor)), dim=0)
+                )
+        return mean_prediction / len(self.support_dataset)
 
-        predOriginal = self.model(data['given'].unsqueeze(0).to(self.device))
-        classOriginal = torch.argmax(predOriginal) if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else 0
-        if self.classToExplain != -1:
-            classOriginal = self.classToExplain
-        probOriginal = torch.softmax(predOriginal, dim=1)[0][classOriginal] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sigmoid(predOriginal)[0][0]
+    def compute_tsgshap(self, test_dataset: list[SupportDatasetItem]):
+        shats_values_list = torch.zeros(
+            len(test_dataset), self.groups_num, device=self.device
+        )
 
-        return predOriginal, classOriginal, probOriginal
-    
-    def _modifyDataBatches(self, data):
-        modifiedDataBatches = []
-        if self.strategyGrouping.value == StrategyGrouping.TIME.value:
-            for subset in self.allSubsets:
-                dataTensor = data['given'].unsqueeze(0).expand(len(self.supportDataset), *data['given'].shape).clone().to(self.device)
-                indexes = torch.tensor(list(subset), dtype=torch.long, device=self.device)
-                dataTensor[:, indexes, :] = self.supportTensor[:, indexes, :].clone()
-                modifiedDataBatches.append(dataTensor.clone())
-        
-        elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
-            for subset in self.allSubsets:
-                dataTensor = data['given'].unsqueeze(0).expand(len(self.supportDataset), *data['given'].shape).clone().to(self.device)
-                indexes = torch.tensor(list(subset), dtype=torch.long, device=self.device)
-                for instant in range(self.windowSize):
-                    dataTensor[:, instant, indexes] = self.supportTensor[:, instant, indexes].clone()
-                modifiedDataBatches.append(dataTensor.clone())
-        
-        elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
+        with torch.no_grad():
+            for idx, data in enumerate(test_dataset):
+                tsgshapvalues = torch.zeros(self.groups_num, device=self.device)
 
-            for subset in self.allSubsets:
-                dataTensor = data['given'].unsqueeze(0).expand(len(self.supportDataset), *data['given'].shape).clone().to(self.device)
-                allIndexes = []
-                
-                for group in subset:
-                    allIndexes.extend(self.customGroups[group])
-                allIndexes = torch.tensor(allIndexes, dtype=torch.long, device=self.device)
-                
-                dataTensor[:, :, allIndexes] = self.supportTensor[:, :, allIndexes].clone()
-                modifiedDataBatches.append(dataTensor)
-            
-        return modifiedDataBatches
-    
-    def _computeProbs(self, modifiedDataBatches, classOriginal):
-        probs = []
-        for i in range(0, len(modifiedDataBatches), self.batchSize):
-            batch = torch.cat(modifiedDataBatches[i:i + self.batchSize]).to(self.device)
+                original_pred, original_class, original_prob = self._predict(data)
+
+                modified_data_batches = self._modify_data_batches(data)
+                probs = self._compute_probs(modified_data_batches, original_class)
+
+                for group in range(self.groups_num):
+                    for size in range(self.groups_num):
+                        prob_with, prob_without = self._compute_differences(
+                            probs, group, size
+                        )
+                        tsgshapvalues[group] += (prob_without - prob_with).mean()
+
+                shats_values_list[idx] = tsgshapvalues.clone()
+
+                del (
+                    modified_data_batches,
+                    probs,
+                    original_pred,
+                    original_class,
+                    original_prob,
+                    tsgshapvalues,
+                )
+                torch.cuda.empty_cache()
+
+        return shats_values_list
+
+    def _predict(self, data: SupportDatasetItem) -> tuple[Tensor, Tensor | int, Tensor]:
+        original_pred = self.model(data["given"].unsqueeze(0).to(self.device))
+        original_class = (
+            torch.argmax(original_pred)
+            if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
+            else 0
+        )
+        if self.class_to_explain != -1:
+            original_class = self.class_to_explain
+        original_prob = (
+            torch.softmax(original_pred, dim=1)[0][original_class]
+            if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
+            else torch.sigmoid(original_pred)[0][0]
+        )
+
+        return original_pred, original_class, original_prob
+
+    def _modify_data_batches(self, data: SupportDatasetItem) -> list[Tensor]:
+        modified_data_batches = list[Tensor]()
+
+        for subset in self.all_subsets:
+            data_tensor = (
+                data["given"]
+                .unsqueeze(0)
+                .expand(len(self.support_dataset), *data["given"].shape)
+                .clone()
+                .to(self.device)
+            )
+            modified_data_batches.append(
+                self.grouping_strategy.modify_tensor(
+                    subset, self.device, self.support_tensor, data_tensor
+                )
+            )
+
+        return modified_data_batches
+
+    def _compute_probs(
+        self, modified_data_batches: list[Tensor], original_class: Tensor | int
+    ) -> Tensor:
+        probs: list[Tensor] = []
+        for i in range(0, len(modified_data_batches), self.batch_size):
+            batch = torch.cat(modified_data_batches[i : i + self.batch_size]).to(
+                self.device
+            )
             guesses = self.model(batch)
-            
-            batchProbs = torch.softmax(guesses, dim=1)[:, classOriginal] if self.strategyPrediction.value == StrategyPrediction.MULTICLASS.value else torch.sigmoid(guesses)[:, 0]
-            probs.extend(batchProbs.cpu())
-            
+
+            batch_probs = (
+                torch.softmax(guesses, dim=1)[:, original_class]
+                if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
+                else torch.sigmoid(guesses)[:, 0]
+            )
+            probs.extend(batch_probs.cpu())
+
         return torch.tensor(probs, device=self.device)
 
-    def _computeDifferences(self, probs, instant, size):
+    def _compute_differences(
+        self, probs: Tensor, instant: int, size: int
+    ) -> tuple[Tensor, Tensor]:
+        subsets_with, subsets_without = self.subsets_dict[(instant, size)]
+        prob_with = torch.zeros(len(subsets_with), device=self.device)
+        prob_without = torch.zeros(len(subsets_without), device=self.device)
 
-        subsetsWith, subsetsWithout = self.subsets_dict[(instant, size)]
-        probWith = torch.zeros(len(subsetsWith), device=self.device)
-        probWithout = torch.zeros(len(subsetsWithout), device=self.device)
+        for i, (item_with, item_without) in enumerate(
+            zip(subsets_with, subsets_without)
+        ):
+            indexes_with = [
+                self.pair_dicts[(tuple(item_with), entity)]
+                for entity in range(len(self.support_dataset))
+            ]
+            indexes_without = [
+                self.pair_dicts[(tuple(item_without), entity)]
+                for entity in range(len(self.support_dataset))
+            ]
+            coef = self.coefficients_dict[len(item_without)]
+            prob_with[i] = probs[indexes_with].mean() * coef
+            prob_without[i] = probs[indexes_without].mean() * coef
 
-        for i, (sWith, sWithout) in enumerate(zip(subsetsWith, subsetsWithout)):
-            indexesWith = [self.pairDicts[(tuple(sWith), entity)] for entity in range(len(self.supportDataset))]
-            indexesWithout = [self.pairDicts[(tuple(sWithout), entity)] for entity in range(len(self.supportDataset))]
-            coef = self.coefDict[len(sWithout)]
-            probWith[i] = probs[indexesWith].mean() * coef 
-            probWithout[i] = probs[indexesWithout].mean() * coef
-            
-        return probWith, probWithout
+        return prob_with, prob_without
 
-    
-    def compute_tsgshap(self, testDataset):
-        shatsValuesList = torch.zeros(len(testDataset), self.numGroups, device=self.device)
+    def compute_fast_shats(self, test_dataset: list[SupportDatasetItem]) -> Tensor:
+        tsgshapvalues_list = torch.zeros(
+            len(test_dataset), self.groups_num, device=self.device
+        )
+        reversed_dict = self._reverse_dict(self.subsets_dict, self.all_subsets)
 
         with torch.no_grad():
+            for idx, data in enumerate(test_dataset):
+                tsgshapvalues = torch.zeros(self.groups_num, device=self.device)
 
-            for idx in range(len(testDataset)):
-                data = testDataset[idx]
-                tsgshapvalues = torch.zeros(self.numGroups, device=self.device)
+                pred_original, class_original, prob_original = self._predict(data)
 
-                predOriginal, classOriginal, probOriginal = self._getPrediction(data)
+                modified_data_batches = self._modify_data_batches(data)
 
-                modifiedDataBatches = self._modifyDataBatches(data)
+                probs = self._compute_probs(modified_data_batches, class_original)
 
-                probs = self._computeProbs(modifiedDataBatches, classOriginal)
+                for i, value in enumerate(reversed_dict.values()):
 
-                for group in range(self.numGroups):
-                    for size in range(self.numGroups):
-                        probWith, probWithout = self._computeDifferences(probs, group, size)
-                        tsgshapvalues[group] += (probWithout - probWith).mean()
+                    add = probs[
+                        i
+                        * len(self.support_dataset) : (i + 1)
+                        * len(self.support_dataset)
+                    ].mean()
 
-                shatsValuesList[idx] = tsgshapvalues.clone()
+                    add = add / self.groups_num
 
-                del modifiedDataBatches, probs, predOriginal, classOriginal, probOriginal, tsgshapvalues
-                torch.cuda.empty_cache()
-        
-        return shatsValuesList
-    
+                    for v in value:
 
-    ### Método alternativo
-    
-    def reverseDict(self, subsets_dict, subsets_total):
-        subsets_dict_reversed = {}
+                        if v[1] == 0:
+                            tsgshapvalues[v[0][0]] -= add / len(
+                                self.subsets_dict[(v[0][0], v[0][1])][0]
+                            )
+
+                        else:
+                            tsgshapvalues[v[0][0]] += add / len(
+                                self.subsets_dict[(v[0][0], v[0][1])][0]
+                            )
+
+                tsgshapvalues_list[idx] = tsgshapvalues.clone()
+
+                del (
+                    modified_data_batches,
+                    probs,
+                    pred_original,
+                    class_original,
+                    prob_original,
+                    tsgshapvalues,
+                )
+
+        return tsgshapvalues_list
+
+    def _reverse_dict(
+        self, subsets_dict: dict[Any, Any], subsets_total: list[Any]
+    ) -> dict[tuple[Any], list[Any]]:
+        subsets_dict_reversed = dict[tuple[Any], list[Any]]()
         for subset in subsets_total:
             subsets_dict_reversed[tuple(subset)] = []
 
         for subset in subsets_total:
-            for clave,valor in subsets_dict.items():
+            for clave, valor in subsets_dict.items():
                 if subset in valor[0]:
                     subsets_dict_reversed[tuple(subset)].append((clave, 0))
 
@@ -198,158 +288,133 @@ class ShaTS:
 
         return subsets_dict_reversed
 
+    def plot_tsgshap(
+        self,
+        shats_values: Tensor,
+        test_dataset_or_predictions: list[SupportDatasetItem] | Tensor,
+        path: str | Path | None = None,
+        segment_size: int = 100,
+    ):
+        if isinstance(test_dataset_or_predictions, list):
+            model_predictions = [
+                self._predict(data) for data in test_dataset_or_predictions
+            ]
+        else:
+            model_predictions = test_dataset_or_predictions
 
-    def compute_fastShats(self, testDataset):
-        tsgshapvalues_list = torch.zeros(len(testDataset), self.numGroups, device=self.device)
-        reversed_dict = self.reverseDict(self.subsets_dict, self.allSubsets)
+        fontsize = 25
+        size = shats_values.shape[0]
 
-        with torch.no_grad():
-            for idx in range(len(testDataset)):
-                data = testDataset[idx]
-                tsgshapvalues = torch.zeros(self.numGroups, device=self.device)
+        arr_plot = np.zeros((self.groups_num, size))
+        arr_prob = np.zeros(size)
 
-                pred_original, class_original, prob_original = self._getPrediction(data)
+        for i in range(size):
+            arr_plot[:, i] = shats_values[i].cpu().numpy()
+            arr_prob[i] = model_predictions[i][2].detach().cpu().numpy()
 
-                modified_data_batches = self._modifyDataBatches(data)
+        vmin, vmax = -0.5, 0.5
+        cmap = plt.get_cmap("bwr")
 
-                probs = self._computeProbs(modified_data_batches, class_original)
-                
-                self.probsfast = probs
+        nSegments = (size + segment_size - 1) // segment_size
+        fig, axs = plt.subplots(
+            nSegments, 1, figsize=(15, 25 * (max(10, self.groups_num) / 36) * nSegments)
+        )  # 15, 25 predictor
 
-                i = 0
-                for key,value in reversed_dict.items():
+        if nSegments == 1:
+            axs = [axs]
 
-                    add = probs[i*len(self.supportDataset):(i+1)*len(self.supportDataset)].mean()
+        for n in range(nSegments):
+            realEnd = min((n + 1) * segment_size, size)
+            if n == nSegments - 1:
+                realEnd = arr_plot.shape[1]
+                arr_plot = np.hstack(
+                    (
+                        arr_plot,
+                        np.zeros(
+                            (self.groups_num, segment_size - (size % segment_size))
+                        ),
+                    )
+                )
+                arr_prob = np.hstack(
+                    (arr_prob, -np.ones(segment_size - (size % segment_size)))
+                )
+                size = arr_plot.shape[1]
 
-                    add = add/self.numGroups
+            init = n * segment_size
+            end = min((n + 1) * segment_size, size)
+            segment = arr_plot[:, init:end]
+            ax = axs[n]
 
-                    for v in value:
+            ax.set_xlabel("Window", fontsize=fontsize)
 
-                        if v[1] == 0:
-                            tsgshapvalues[v[0][0]] -= add/len(self.subsets_dict[(v[0][0], v[0][1])][0])
+            cax = ax.imshow(
+                segment,
+                cmap=cmap,
+                interpolation="nearest",
+                vmin=vmin,
+                vmax=vmax,
+                aspect="auto",
+            )
 
-                        else:
-                            tsgshapvalues[v[0][0]] += add/len(self.subsets_dict[(v[0][0], v[0][1])][0])
+            cbarAx = fig.add_axes(
+                [
+                    ax.get_position().x1 + 0.15,
+                    ax.get_position().y0 - 0.05,
+                    0.05,
+                    ax.get_position().height + 0.125,
+                ]
+            )
 
-                    i += 1
+            cbar = fig.colorbar(cax, cax=cbarAx, orientation="vertical")
+            cbar.ax.tick_params(labelsize=fontsize)
 
-                tsgshapvalues_list[idx] = tsgshapvalues.clone()
+            ax2 = ax.twinx()
 
-                del modified_data_batches, probs, pred_original, class_original, prob_original, tsgshapvalues
-        
-        return tsgshapvalues_list
+            # prediction = arr_prob[init:end]
 
+            prediction = arr_prob[init:realEnd]  # Ajustar a realEnd
+            ax2.plot(
+                np.arange(0, realEnd - init),
+                prediction,
+                linestyle="--",
+                color="darkviolet",
+                linewidth=4,
+            )
 
+            ax2.axhline(0.5, color="black", linewidth=1, linestyle="--")
+            ax2.set_ylim(0, 1)
+            ax2.tick_params(axis="y", labelsize=fontsize)
 
+            ax2.set_ylabel("Model outcome", fontsize=fontsize)
 
+            legend = ax2.legend(
+                ["Model outcome", "Threshold"],
+                fontsize=fontsize,
+                loc="lower left",
+                bbox_to_anchor=(0.0, -0.0),
+            )
+            legend.get_frame().set_alpha(None)
+            legend.get_frame().set_facecolor((0, 0, 0, 0))
+            legend.get_frame().set_edgecolor("black")
 
-        
-    def plot_tsgshap(self, 
-                        shatsValues, 
-                        testDataset = None, 
-                        modelPredictions = None, 
-                        path=None,
-                        segmentSize=100):
+            title, y_label, columns_labels = self.grouping_strategy.get_plot_texts()
 
-            if modelPredictions is None:
-                if testDataset is None:
-                    raise ValueError("If modelPredictions is not provided, testDataset must be provided.")
-                modelPredictions = [self._getPrediction(data) for data in testDataset]
+            ax.set_ylabel(y_label, fontsize=fontsize)
+            ax.set_title(title, fontsize=fontsize)
 
-            fontsize = 25
-            size = shatsValues.shape[0]
+            ax.set_yticks(np.arange(self.groups_num))
+            ax.set_yticklabels(columns_labels, fontsize=fontsize)
 
-            arr_plot = np.zeros((self.numGroups, size))
-            arr_prob = np.zeros(size)
+            xticks = np.arange(0, segment.shape[1], 5)
+            xlabels = np.arange(init, realEnd, 5)
 
-            for i in range(size):
-                arr_plot[:, i] = shatsValues[i].cpu().numpy()
-                arr_prob[i] = modelPredictions[i][2].detach().cpu().numpy()
-            
-            vmin, vmax = -0.5, 0.5
-            cmap = plt.get_cmap('bwr')
+            xticks = xticks[: len(xlabels)]
 
-            nSegments = (size + segmentSize - 1) // segmentSize
-            fig, axs = plt.subplots(nSegments, 1, figsize=(15, 25 * (max(10, self.numGroups)/36) * nSegments)) #15, 25 predictor
-            
-            if nSegments == 1:
-                axs = [axs]
-            
-            for n in range(nSegments):
-                realEnd = min((n + 1) * segmentSize, size)
-                if n == nSegments - 1:
-                    realEnd = arr_plot.shape[1]
-                    arr_plot = np.hstack((arr_plot, np.zeros((self.numGroups, segmentSize - (size % segmentSize)))))
-                    arr_prob = np.hstack((arr_prob, -np.ones(segmentSize - (size % segmentSize))))
-                    size = arr_plot.shape[1]
-                
-                init = n * segmentSize
-                end = min((n + 1) * segmentSize, size)
-                segment = arr_plot[:, init:end]
-                ax = axs[n]
+            ax.set_xticks(xticks)
+            ax.set_xticklabels(xlabels, fontsize=fontsize)
 
+        plt.tight_layout()
 
-                ax.set_xlabel('Window', fontsize=fontsize)
-
-                cax = ax.imshow(segment, cmap=cmap, interpolation='nearest', vmin=vmin, vmax=vmax, aspect='auto')
-                
-                cbarAx = fig.add_axes([ax.get_position().x1 + 0.15,  
-                                        ax.get_position().y0 - 0.05,          
-                                        0.05,                          
-                                        ax.get_position().height + 0.125])     
-
-                cbar = fig.colorbar(cax, cax=cbarAx, orientation='vertical')
-                cbar.ax.tick_params(labelsize=fontsize)
-                
-                ax2 = ax.twinx()
-
-                #prediction = arr_prob[init:end]
-
-                prediction = arr_prob[init:realEnd]  # Ajustar a realEnd
-                ax2.plot(np.arange(0, realEnd - init), prediction, linestyle='--', color='darkviolet', linewidth=4)
-                    
-                ax2.axhline(0.5, color='black', linewidth=1, linestyle='--')
-                ax2.set_ylim(0, 1)
-                ax2.tick_params(axis='y', labelsize=fontsize)
-
-                ax2.set_ylabel('Model outcome', fontsize=fontsize)
-                
-                legend = ax2.legend(['Model outcome', 'Threshold'], fontsize=fontsize, loc = 'lower left', bbox_to_anchor=(0.0, -0.0))
-                legend.get_frame().set_alpha(None)
-                legend.get_frame().set_facecolor((0, 0, 0, 0))
-                legend.get_frame().set_edgecolor('black')
-
-                #switch case of the ylabel depending on the grouping strategy
-                if self.strategyGrouping.value == StrategyGrouping.TIME.value:
-                    ylabel = 'Time'
-                    textName = 'TSG-SHAP (Temporal)'
-                    nameColumns = self.nameInstants
-                elif self.strategyGrouping.value == StrategyGrouping.FEATURE.value:
-                    ylabel = 'Feature'
-                    textName = 'TSG-SHAP (Feature)'
-                    nameColumns = self.nameFeatures
-                elif self.strategyGrouping.value == StrategyGrouping.MULTIFEATURE.value:
-                    ylabel = 'MULTIFEATURE'
-                    textName = 'TSG-SHAP ---MULTIFEATURE)'
-                    nameColumns = self.nameGroups
-
-                ax.set_ylabel(ylabel, fontsize=fontsize)
-                ax.set_title(textName, fontsize=fontsize)
-
-                ax.set_yticks(np.arange(self.numGroups))
-                ax.set_yticklabels(nameColumns, fontsize=fontsize)
-                
-                xticks = np.arange(0, segment.shape[1], 5)  
-                xlabels = np.arange(init, realEnd, 5)    
-
-                xticks = xticks[:len(xlabels)]             
-
-                ax.set_xticks(xticks)
-                ax.set_xticklabels(xlabels, fontsize=fontsize)
-        
-            plt.tight_layout()
-
-            if path is not None:
-                plt.savefig(path)
-            plt.show()
-
+        if path is not None:
+            plt.savefig(path)
+        plt.show()
