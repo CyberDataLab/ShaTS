@@ -1,5 +1,6 @@
 import math
 import random
+import numpy as np
 from enum import Enum
 from typing import Dict, List, Tuple
 
@@ -114,4 +115,49 @@ def generateSubsets(nGroups: int, nSubsets: int, strategy: StrategySubsets = Str
     flatennedSubsets = [list(subset) for sizeSubsets in allSubsets for subset in sizeSubsets]
 
     return subsetDict, flatennedSubsets
+
+
+def estimate_m(numFeatures, numSubsetsDesired):
+
+    critico = 2*sum([(i+1)**(2/3) for i in range(numFeatures)])/ numFeatures**(2/3)
+    critico = round(critico)
+
+    if numSubsetsDesired <= critico:
+        return critico
+
+    step = max((critico**2 - critico) // 20, 1)
+    values = range(critico, critico**2, step)
+    list_values = list(values)
+
+    sizes = []
+
+    for value in list_values:
+        subsets_dict, subsets_total = generateSubsets(numFeatures, value)
+        sizes.append(len(subsets_total))
+
+    # Convertir listas a arrays para facilitar cálculos
+    X = np.array(list_values)
+    y = np.array(sizes)
+
+    # Calcular los coeficientes de la regresión lineal
+    n = len(X)
+    mean_x = np.mean(X)
+    mean_y = np.mean(y)
+
+    # Calcular la pendiente (m) y la intersección (b) de la recta
+    numer = np.sum((X - mean_x) * (y - mean_y))
+    denom = np.sum((X - mean_x) ** 2)
+    slope = numer / denom
+    intercept = mean_y - slope * mean_x
+
+    # Calcular el valor de m
+    m = (numSubsetsDesired - intercept) / slope
+
+    if np.isinf(m) or np.isnan(m):
+        return critico
+
+    if m < 0:
+        return critico
+
+    return round(m)
 

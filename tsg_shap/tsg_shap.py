@@ -2,7 +2,7 @@ import torch
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generateSubsets
+from .utils import StrategySubsets, StrategyGrouping, StrategyPrediction, generateSubsets, estimate_m
 
 
 class ShaTS:
@@ -34,13 +34,14 @@ class ShaTS:
         self.strategyPrediction = strategyPrediction
         self.customGroups = customGroups
         self.device = device
-        self.m = m
         self.batchSize = batchSize
         self.verbose = verbose
         self.nclass = nclass
         self.classToExplain = classToExplain
 
         self._initializeGroups(nameFeatures, nameGroups, nameInstants)
+        self.m = estimate_m(self.numGroups, m)
+
         
         self.subsets_dict, self.allSubsets = generateSubsets(self.numGroups, self.m, self.strategySubsets)
         self.keysSupportSubsets = [(tuple(subset), entity) for subset in self.allSubsets for entity in range(len(self.supportDataset))]
@@ -178,6 +179,70 @@ class ShaTS:
                 torch.cuda.empty_cache()
         
         return shatsValuesList
+    
+
+    ### Método alternativo
+    
+    def reverseDict(self, subsets_dict, subsets_total):
+        subsets_dict_reversed = {}
+        for subset in subsets_total:
+            subsets_dict_reversed[tuple(subset)] = []
+
+        for subset in subsets_total:
+            for clave,valor in subsets_dict.items():
+                if subset in valor[0]:
+                    subsets_dict_reversed[tuple(subset)].append((clave, 0))
+
+                if subset in valor[1]:
+                    subsets_dict_reversed[tuple(subset)].append((clave, 1))
+
+        return subsets_dict_reversed
+
+
+    def compute_fastShats(self, testDataset):
+        tsgshapvalues_list = torch.zeros(len(testDataset), self.numGroups, device=self.device)
+        reversed_dict = self.reverseDict(self.subsets_dict, self.allSubsets)
+
+        with torch.no_grad():
+            for idx in range(len(testDataset)):
+                data = testDataset[idx]
+                tsgshapvalues = torch.zeros(self.numGroups, device=self.device)
+
+                pred_original, class_original, prob_original = self._getPrediction(data)
+
+                modified_data_batches = self._modifyDataBatches(data)
+
+                probs = self._computeProbs(modified_data_batches, class_original)
+                
+                self.probsfast = probs
+
+                i = 0
+                for key,value in reversed_dict.items():
+
+                    add = probs[i*len(self.supportDataset):(i+1)*len(self.supportDataset)].mean()
+
+                    add = add/self.numGroups
+
+                    for v in value:
+
+                        if v[1] == 0:
+                            tsgshapvalues[v[0][0]] -= add/len(self.subsets_dict[(v[0][0], v[0][1])][0])
+
+                        else:
+                            tsgshapvalues[v[0][0]] += add/len(self.subsets_dict[(v[0][0], v[0][1])][0])
+
+                    i += 1
+
+                tsgshapvalues_list[idx] = tsgshapvalues.clone()
+
+                del modified_data_batches, probs, pred_original, class_original, prob_original, tsgshapvalues
+        
+        return tsgshapvalues_list
+
+
+
+
+
         
     def plot_tsgshap(self, 
                         shatsValues, 
