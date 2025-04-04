@@ -1,6 +1,7 @@
 import math
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
+from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,50 +9,72 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
-from tsg_shap.grouping import AbstractGroupingStrategy
+from tsg_shap.grouping import AbstractGroupingStrategy, TimeGroupingStrategy, FeaturesGroupingStrategy, MultifeaturesGroupingStrategy
 
 from .utils import StrategyPrediction, StrategySubsets, estimate_m, generate_subsets
-
-
-class SupportDatasetItem(TypedDict):
-    given: Tensor
-    answer: Tensor
-    label: Tensor
 
 
 class ShaTS:
     def __init__(
         self,
         model: Module,
-        support_dataset: list[SupportDatasetItem],
-        grouping_strategy: AbstractGroupingStrategy,
+        support_dataset: list[Tensor],
+        grouping_strategy: str | AbstractGroupingStrategy,
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
         prediction_strategy: StrategyPrediction = StrategyPrediction.MULTICLASS,
         m: int = 5,
         batch_size: int = 32,
-        custom_groups: list[list[int]] | None = None,
         device: str | torch.device | int = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         ),
         nclass: int = 2,
         class_to_explain: int = -1,
+        custom_groups: list[list[int]] | None = None,
+        model_wrapper: Callable[[Module, Tensor, Tensor], Tensor] | None = None,
     ):
 
         self.model = model
         self.support_dataset = support_dataset
         self.support_tensor = torch.stack(
-            [data["given"] for data in support_dataset]
+            [data for data in support_dataset]
         ).to(device)
-        self.window_size = support_dataset[0]["given"].shape[0]
-        self.num_of_features = support_dataset[0]["given"].shape[1]
+        self.window_size = support_dataset[0].shape[0]
+        self.num_of_features = support_dataset[0].shape[1]
         self.subsets_generation_strategy = subsets_generation_strategy
-        self.grouping_strategy = grouping_strategy
+        self.grouping_strategy : AbstractGroupingStrategy
+        
+        if isinstance(grouping_strategy, AbstractGroupingStrategy):
+            self.grouping_strategy = grouping_strategy
+
+        elif grouping_strategy == "time":
+            self.grouping_strategy = TimeGroupingStrategy(
+                groups_num=self.window_size
+            )
+        elif grouping_strategy == "feature":
+            self.grouping_strategy = FeaturesGroupingStrategy(
+                groups_num=self.num_of_features
+            )
+        elif grouping_strategy == "multifeature":
+            if custom_groups is None:
+                raise ValueError(
+                    "custom_groups must be provided when grouping_strategy is 'multifeature'."
+                )
+            self.grouping_strategy = MultifeaturesGroupingStrategy(
+                groups_num=len(custom_groups),
+                custom_groups=custom_groups,
+            )
+        else:
+            raise ValueError(
+                "grouping_strategy must be 'time', 'feature', or 'multifeature'."
+            )
+
+        
         self.prediction_strategy = prediction_strategy
-        self.custom_groups = custom_groups
         self.device = device
         self.batch_size = batch_size
         self.nclass = nclass
         self.class_to_explain = class_to_explain
+        self.model_wrapper = model_wrapper
 
         self.m = estimate_m(self.groups_num, m)
 
@@ -95,7 +118,8 @@ class ShaTS:
         with torch.no_grad():
             for i in range(0, len(self.support_dataset), self.batch_size):
                 batch = self.support_dataset[i : i + self.batch_size]
-                batch_tensor = torch.stack([data["given"] for data in batch]).to(
+                #batch_tensor = torch.stack(batch).to(self.device)
+                batch_tensor = torch.stack([data for data in batch]).to(
                     self.device
                 )
                 mean_prediction += (
@@ -106,13 +130,16 @@ class ShaTS:
                 )
         return mean_prediction / len(self.support_dataset)
 
-    def compute_tsgshap(self, test_dataset: list[SupportDatasetItem]):
+    def compute_tsgshap(self, test_dataset: list[Tensor]):
         shats_values_list = torch.zeros(
             len(test_dataset), self.groups_num, device=self.device
         )
-
+        total = len(test_dataset)
         with torch.no_grad():
             for idx, data in enumerate(test_dataset):
+                progress = (idx + 1) / total * 100
+                print(f"\rProcessing item {idx + 1}/{total} ({progress:.2f}%)", end="")
+
                 tsgshapvalues = torch.zeros(self.groups_num, device=self.device)
 
                 original_pred, original_class, original_prob = self._predict(data)
@@ -141,8 +168,8 @@ class ShaTS:
 
         return shats_values_list
 
-    def _predict(self, data: SupportDatasetItem) -> tuple[Tensor, Tensor | int, Tensor]:
-        original_pred = self.model(data["given"].unsqueeze(0).to(self.device))
+    def _predict(self, data: Tensor) -> tuple[Tensor, Tensor | int, Tensor]:
+        original_pred = self.model(data.unsqueeze(0).to(self.device))
         original_class = (
             torch.argmax(original_pred)
             if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
@@ -158,14 +185,14 @@ class ShaTS:
 
         return original_pred, original_class, original_prob
 
-    def _modify_data_batches(self, data: SupportDatasetItem) -> list[Tensor]:
+    def _modify_data_batches(self, data: Tensor) -> list[Tensor]:
         modified_data_batches = list[Tensor]()
 
         for subset in self.all_subsets:
             data_tensor = (
-                data["given"]
+                data
                 .unsqueeze(0)
-                .expand(len(self.support_dataset), *data["given"].shape)
+                .expand(len(self.support_dataset), *data.shape)
                 .clone()
                 .to(self.device)
             )
@@ -185,13 +212,20 @@ class ShaTS:
             batch = torch.cat(modified_data_batches[i : i + self.batch_size]).to(
                 self.device
             )
-            guesses = self.model(batch)
+            if self.model_wrapper is not None:
+                batch_probs = self.model_wrapper(
+                    self.model, batch, original_class
+                )
+            else:
+                guesses = self.model(batch)
 
-            batch_probs = (
-                torch.softmax(guesses, dim=1)[:, original_class]
-                if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
-                else torch.sigmoid(guesses)[:, 0]
-            )
+                batch_probs = (
+                    torch.softmax(guesses, dim=1)[:, original_class]
+                    if self.prediction_strategy.value == StrategyPrediction.MULTICLASS.value
+                    else torch.sigmoid(guesses)[:, 0]
+                )
+
+
             probs.extend(batch_probs.cpu())
 
         return torch.tensor(probs, device=self.device)
@@ -220,14 +254,18 @@ class ShaTS:
 
         return prob_with, prob_without
 
-    def compute_fast_shats(self, test_dataset: list[SupportDatasetItem]) -> Tensor:
+    def compute_fast_shats(self, test_dataset: list[Tensor]) -> Tensor:
         tsgshapvalues_list = torch.zeros(
             len(test_dataset), self.groups_num, device=self.device
         )
         reversed_dict = self._reverse_dict(self.subsets_dict, self.all_subsets)
 
+        total = len(test_dataset)
         with torch.no_grad():
             for idx, data in enumerate(test_dataset):
+                progress = (idx + 1) / total * 100
+                print(f"\rProcessing item {idx + 1}/{total} ({progress:.2f}%)", end="")
+
                 tsgshapvalues = torch.zeros(self.groups_num, device=self.device)
 
                 pred_original, class_original, prob_original = self._predict(data)
@@ -237,7 +275,6 @@ class ShaTS:
                 probs = self._compute_probs(modified_data_batches, class_original)
 
                 for i, value in enumerate(reversed_dict.values()):
-
                     add = probs[
                         i
                         * len(self.support_dataset) : (i + 1)
@@ -245,7 +282,6 @@ class ShaTS:
                     ].mean()
 
                     add = add / self.groups_num
-
                     for v in value:
 
                         if v[1] == 0:
@@ -257,7 +293,6 @@ class ShaTS:
                             tsgshapvalues[v[0][0]] += add / len(
                                 self.subsets_dict[(v[0][0], v[0][1])][0]
                             )
-
                 tsgshapvalues_list[idx] = tsgshapvalues.clone()
 
                 del (
@@ -280,10 +315,10 @@ class ShaTS:
 
         for subset in subsets_total:
             for clave, valor in subsets_dict.items():
-                if subset in valor[0]:
+                if list(subset) in valor[0]:
                     subsets_dict_reversed[tuple(subset)].append((clave, 0))
 
-                if subset in valor[1]:
+                if list(subset) in valor[1]:
                     subsets_dict_reversed[tuple(subset)].append((clave, 1))
 
         return subsets_dict_reversed
@@ -291,16 +326,25 @@ class ShaTS:
     def plot_tsgshap(
         self,
         shats_values: Tensor,
-        test_dataset_or_predictions: list[SupportDatasetItem] | Tensor,
+        test_dataset: list[Tensor] | None = None,
+        predictions: list[Tensor] | None = None,
         path: str | Path | None = None,
         segment_size: int = 100,
     ):
-        if isinstance(test_dataset_or_predictions, list):
-            model_predictions = [
-                self._predict(data) for data in test_dataset_or_predictions
-            ]
+        if test_dataset is None and predictions is None:
+            raise ValueError(
+                "Either test_dataset or predictions must be provided."
+            )
+        if test_dataset is not None and predictions is not None:
+            raise ValueError(
+                "Only one of test_dataset or predictions should be provided."
+            )
+        if predictions is not None:
+            model_predictions = predictions
         else:
-            model_predictions = test_dataset_or_predictions
+            model_predictions = [
+                self._predict(data) for data in test_dataset
+            ]
 
         fontsize = 25
         size = shats_values.shape[0]
@@ -315,18 +359,18 @@ class ShaTS:
         vmin, vmax = -0.5, 0.5
         cmap = plt.get_cmap("bwr")
 
-        nSegments = (size + segment_size - 1) // segment_size
+        n_segments = (size + segment_size - 1) // segment_size
         fig, axs = plt.subplots(
-            nSegments, 1, figsize=(15, 25 * (max(10, self.groups_num) / 36) * nSegments)
+            n_segments, 1, figsize=(15, 25 * (max(10, self.groups_num) / 36) * n_segments)
         )  # 15, 25 predictor
 
-        if nSegments == 1:
+        if n_segments == 1:
             axs = [axs]
 
-        for n in range(nSegments):
-            realEnd = min((n + 1) * segment_size, size)
-            if n == nSegments - 1:
-                realEnd = arr_plot.shape[1]
+        for n in range(n_segments):
+            real_end = min((n + 1) * segment_size, size)
+            if n == n_segments - 1:
+                real_end = arr_plot.shape[1]
                 arr_plot = np.hstack(
                     (
                         arr_plot,
@@ -356,7 +400,7 @@ class ShaTS:
                 aspect="auto",
             )
 
-            cbarAx = fig.add_axes(
+            cbar_ax = fig.add_axes(
                 [
                     ax.get_position().x1 + 0.15,
                     ax.get_position().y0 - 0.05,
@@ -365,16 +409,16 @@ class ShaTS:
                 ]
             )
 
-            cbar = fig.colorbar(cax, cax=cbarAx, orientation="vertical")
+            cbar = fig.colorbar(cax, cax=cbar_ax, orientation="vertical")
             cbar.ax.tick_params(labelsize=fontsize)
 
             ax2 = ax.twinx()
 
             # prediction = arr_prob[init:end]
 
-            prediction = arr_prob[init:realEnd]  # Ajustar a realEnd
+            prediction = arr_prob[init:real_end]  # Ajustar a realEnd
             ax2.plot(
-                np.arange(0, realEnd - init),
+                np.arange(0, real_end - init),
                 prediction,
                 linestyle="--",
                 color="darkviolet",
@@ -406,7 +450,7 @@ class ShaTS:
             ax.set_yticklabels(columns_labels, fontsize=fontsize)
 
             xticks = np.arange(0, segment.shape[1], 5)
-            xlabels = np.arange(init, realEnd, 5)
+            xlabels = np.arange(init, real_end, 5)
 
             xticks = xticks[: len(xlabels)]
 
