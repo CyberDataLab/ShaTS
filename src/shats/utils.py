@@ -1,3 +1,6 @@
+"""
+This module contains utility functions for generating subsets for the estimation
+"""
 import math
 import random
 from enum import Enum
@@ -5,27 +8,23 @@ from typing import NamedTuple
 
 import numpy as np
 
-
 class StrategySubsets(Enum):
     """Enum representing the subsets generation strategy."""
 
     EXACT = 1
     APPROX = 2
 
-
-class StrategyPrediction(Enum):
-    """Enum representing the prediction kind."""
-
-    ONECLASS = 1
-    MULTICLASS = 2
-
-
 Subset = tuple[int, ...]
-
 Predictors2subsetsDict = dict[tuple[int, int], tuple[list[Subset], list[Subset]]]
 
 
 class GeneratedSubsets(NamedTuple):
+    """
+    Named tuple representing the generated subsets.
+    Attributes:
+        predictors_to_subsets: A dictionary mapping (predictor, size) to subsets.
+        all_subsets: A list of all unique subsets generated.
+    """
     predictors_to_subsets: Predictors2subsetsDict
     all_subsets: list[Subset]
 
@@ -43,7 +42,7 @@ def generate_subsets(
         nSubsets (int): Number of subsets to generate for each group and size.
         strategy (StrategySubsets): Strategy for subset generation. Options are:
             - StrategySubsets.EXACT: Generate all possible subsets of each size for each group.
-            - StrategySubsets.APPROX: Generate approximately `nSubsets` subsets for each size per group.
+            - StrategySubsets.APPROX: Generate `nSubsets` subsets for each size per group.
 
     Returns:
         Tuple[Dict[Tuple[int, int], Tuple[List[List[int]], List[List[int]]]], List[List[int]]]:

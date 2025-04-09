@@ -1,3 +1,7 @@
+"""
+Module providing the ShaTS abstract class and two implementations of it: 
+ApproShaTS and FastShaTS.
+"""
 import math
 from pathlib import Path
 from typing import Any
@@ -8,19 +12,34 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import Tensor
-from torch.nn import Module
 
-from tsg_shap.grouping import AbstractGroupingStrategy, TimeGroupingStrategy, FeaturesGroupingStrategy, MultifeaturesGroupingStrategy
+from .grouping import (
+    AbstractGroupingStrategy,
+    FeaturesGroupingStrategy,
+    MultifeaturesGroupingStrategy,
+    TimeGroupingStrategy)
 
 from .utils import StrategySubsets, estimate_m, generate_subsets
 
 
 class ShaTS(ABC):
-    "Abstract class for initializing ShaTS module"
+    """
+    Abstract class for initializing ShaTS module
+
+    Args:
+        model_wrapper (Callable[..., Tensor]): A function that wraps the model to be explained and returns the output.
+        support_dataset (list[Tensor]): List of tensors representing the support dataset.
+        grouping_strategy (str | AbstractGroupingStrategy): The strategy for grouping features. 
+        subsets_generation_strategy (StrategySubsets): The strategy for generating subsets.
+        m (int): Number of subsets to be generated.
+        batch_size (int): Size of the batches for processing data.
+        device (str | torch.device | int): Device to perform computations on.
+        custom_groups (list[list[int]] | None): Custom groups for multifeature grouping strategy.
+    
+    """
     def __init__(
         self,
-        model: Module,
-        model_wrapper: Callable[..., Tensor],
+        model_wrapper: Callable[[Tensor], Tensor],
         support_dataset: list[Tensor],
         grouping_strategy: str | AbstractGroupingStrategy,
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
@@ -32,7 +51,6 @@ class ShaTS(ABC):
         custom_groups: list[list[int]] | None = None,
     ):
 
-        self.model = model
         self.support_dataset = support_dataset
         self.support_tensor = torch.stack(
             [data for data in support_dataset]
@@ -41,7 +59,7 @@ class ShaTS(ABC):
         self.num_of_features = support_dataset[0].shape[1]
         self.subsets_generation_strategy = subsets_generation_strategy
         self.grouping_strategy : AbstractGroupingStrategy
-        
+
         if isinstance(grouping_strategy, AbstractGroupingStrategy):
             self.grouping_strategy = grouping_strategy
 
@@ -67,10 +85,9 @@ class ShaTS(ABC):
                 "grouping_strategy must be 'time', 'feature', or 'multifeature'."
             )
 
-        
         self.device = device
         self.batch_size = batch_size
-        self.nclass = model_wrapper(model, support_dataset[0]).shape[1]
+        self.nclass = model_wrapper(support_dataset[0]).shape[1]
         self.model_wrapper = model_wrapper
 
         self.m = estimate_m(self.groups_num, m)
@@ -94,13 +111,21 @@ class ShaTS(ABC):
 
     @property
     def groups_num(self) -> int:
+        """Returns the number of groups."""
         return self.grouping_strategy.groups_num
-    
+
     @abstractmethod
     def compute(
-        self, 
+        self,
         test_dataset: list[Tensor]
     ) -> Tensor:
+        """ 
+        Computes the ShaTS values for the given test dataset.
+        Args:
+            test_dataset (list[Tensor]): List of tensors representing the test dataset.
+        Returns:
+            Tensor: Computed ShaTS values.
+        """
         raise NotImplementedError()
 
     def plot(
@@ -112,6 +137,22 @@ class ShaTS(ABC):
         segment_size: int = 100,
         class_to_explain: int = 0,
     ):
+        """
+        Plots the ShaTS values.
+
+        Args:
+            shats_values (Tensor): The computed ShaTS values.
+            test_dataset (list[Tensor], optional): The test dataset related to the shats_values. 
+                                                    Defaults to None.
+            predictions (Tensor, optional): The model predictions of the shats_values. 
+                                            Defaults to None.
+            path (str | Path, optional): Path to save the plot. Defaults to None.
+            segment_size (int, optional): Size of each segment in the plot. Defaults to 100.
+            class_to_explain (int, optional): Class index to explain. Defaults to 0.
+        Raises:
+            ValueError: If both test_dataset and predictions are None, or if both are provided.
+        """
+
         if test_dataset is None and predictions is None:
             raise ValueError(
                 "Either test_dataset or predictions must be provided."
@@ -127,8 +168,7 @@ class ShaTS(ABC):
                 len(test_dataset), device=self.device
             )
             for i, data in enumerate(test_dataset):
-                model_predictions[i] = self.model_wrapper(self.model, data)[0][class_to_explain]
-        
+                model_predictions[i] = self.model_wrapper(data)[0][class_to_explain]
         shats_values = shats_values[:,:, class_to_explain]
         fontsize = 25
         size = shats_values.shape[0]
@@ -185,12 +225,12 @@ class ShaTS(ABC):
             )
 
             cbar_ax = fig.add_axes(
-                [
+                (
                     ax.get_position().x1 + 0.15,
                     ax.get_position().y0 - 0.05,
                     0.05,
                     ax.get_position().height + 0.125,
-                ]
+                )
             )
 
             cbar = fig.colorbar(cax, cax=cbar_ax, orientation="vertical")
@@ -239,7 +279,7 @@ class ShaTS(ABC):
             ax.set_xticks(xticks)
             ax.set_xticklabels(xlabels, fontsize=fontsize)
 
-        plt.tight_layout()
+        #plt.tight_layout()
 
         if path is not None:
             plt.savefig(path)
@@ -248,6 +288,11 @@ class ShaTS(ABC):
 
 
     def _generate_coefficients_dict(self) -> dict[int, float]:
+        """
+        Generates a dictionary of coefficients for each group size.
+        The coefficients are calculated based on the number of groups and the
+        subsets generation strategy.
+        """
         coef_dict = dict[int, float]()
         if self.subsets_generation_strategy.value == StrategySubsets.EXACT.value:
             for i in range(self.groups_num):
@@ -262,11 +307,14 @@ class ShaTS(ABC):
         return coef_dict
 
     def _compute_mean_prediction(self) -> Tensor:
+        """
+        Computes the mean prediction of the model on the support dataset.
+        """
         mean_prediction = torch.zeros(self.nclass, device=self.device)
 
         with torch.no_grad():
             for data in self.support_dataset:
-                probs = self.model_wrapper(self.model, data)
+                probs = self.model_wrapper(data)
                 for class_idx in range(self.nclass):
                     mean_prediction[class_idx] += probs[0, class_idx].cpu()
 
@@ -274,6 +322,9 @@ class ShaTS(ABC):
 
 
     def _modify_data_batches(self, data: Tensor) -> list[Tensor]:
+        """
+        Modifies the data batches based on the grouping strategy.
+        """
         modified_data_batches = list[Tensor]()
 
         for subset in self.all_subsets:
@@ -293,16 +344,18 @@ class ShaTS(ABC):
         return modified_data_batches
 
     def _compute_probs(
-        self, 
+        self,
         modified_data_batches: list[Tensor]
     ) -> list[Tensor]:
+        """
+        Computes the probabilities of the model based on the modified data batches.
+        """
         probs: list[list[Tensor]] = []
         probs = [[] for _ in range(self.nclass)]
 
         for i in range(0, len(modified_data_batches), self.batch_size):
             batch = torch.cat(modified_data_batches[i : i + self.batch_size]).to(self.device)
-            
-            batch_probs = self.model_wrapper(self.model, batch)
+            batch_probs = self.model_wrapper(batch)
 
             for class_idx in range(self.nclass):
                 class_probs = batch_probs[:, class_idx].cpu()
@@ -315,6 +368,10 @@ class ShaTS(ABC):
     def _compute_differences(
         self, probs: Tensor, instant: int, size: int
     ) -> tuple[Tensor, Tensor]:
+        """
+        Computes the differences between the probabilities of the model for the
+        subsets with and without the current group.
+        """
         subsets_with, subsets_without = self.subsets_dict[(instant, size)]
         prob_with = torch.zeros(self.nclass, len(subsets_with), device=self.device)
         prob_without = torch.zeros(self.nclass, len(subsets_without), device=self.device)
@@ -330,41 +387,38 @@ class ShaTS(ABC):
                 self.pair_dicts[(tuple(item_without), entity)]
                 for entity in range(len(self.support_dataset))
             ]
-            # Convert indexes to tensors
-            indexes_with = torch.tensor(indexes_with, dtype=torch.long, device=self.device)
-            indexes_without = torch.tensor(indexes_without, dtype=torch.long, device=self.device)
-
+            indexes_with_tensor = torch.tensor(indexes_with,
+                                               dtype=torch.long, device=self.device)
+            indexes_without_tensor = torch.tensor(indexes_without,
+                                                  dtype=torch.long, device=self.device)
             coef = self.coefficients_dict[len(item_without)]
-
-            # Initialize tensors for storing the selected probabilities
             mean_probs_with = torch.zeros(self.nclass, device=self.device)
             mean_probs_without = torch.zeros(self.nclass, device=self.device)
 
-            # Iterate over each class and compute the mean probability
             for class_idx in range(self.nclass):
-                # Select probabilities for the current class
-                selected_probs_with = torch.index_select(probs[class_idx], 0, indexes_with)
-                selected_probs_without = torch.index_select(probs[class_idx], 0, indexes_without)
+                selected_probs_with = torch.index_select(probs[class_idx],
+                                                         0, indexes_with_tensor)
+                selected_probs_without = torch.index_select(probs[class_idx],
+                                                            0, indexes_without_tensor)
 
-                # Compute the mean of selected probabilities for each class
                 mean_probs_with[class_idx] = selected_probs_with.mean() * coef
                 mean_probs_without[class_idx] = selected_probs_without.mean() * coef
 
-            # Assign to the probability tensors
             prob_with[:, i] = mean_probs_with
             prob_without[:, i] = mean_probs_without
 
 
         return prob_with, prob_without
-    
-
 
 
 class ApproShaTS(ShaTS):
+    """
+    Original implementation of the ShaTS algorithm. 
+    This implementation is optimized for resource efficiency.
+    """
     def __init__(
         self,
-        model: Module,
-        model_wrapper: Callable[..., Tensor],
+        model_wrapper: Callable[[Tensor], Tensor],
         support_dataset: list[Tensor],
         grouping_strategy: str | AbstractGroupingStrategy,
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
@@ -376,7 +430,6 @@ class ApproShaTS(ShaTS):
         custom_groups: list[list[int]] | None = None,
     ):
         super().__init__(
-            model=model,
             support_dataset=support_dataset,
             grouping_strategy=grouping_strategy,
             subsets_generation_strategy=subsets_generation_strategy,
@@ -392,8 +445,8 @@ class ApproShaTS(ShaTS):
         test_dataset: list[Tensor]
     ) -> Tensor:
         shats_values_list = torch.zeros(
-        len(test_dataset), 
-        self.groups_num, 
+        len(test_dataset),
+        self.groups_num,
         self.nclass,
         device=self.device
         )
@@ -434,10 +487,13 @@ class ApproShaTS(ShaTS):
 
 
 class FastShaTS(ShaTS):
+    """
+    Fast implementation of the ShaTS algorithm. 
+    This implementation is based on the original ShaTS algorithm but optimized for speed.
+    """
     def __init__(
         self,
-        model: Module,
-        model_wrapper: Callable[..., Tensor],
+        model_wrapper: Callable[[Tensor], Tensor],
         support_dataset: list[Tensor],
         grouping_strategy: str | AbstractGroupingStrategy,
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
@@ -449,7 +505,6 @@ class FastShaTS(ShaTS):
         custom_groups: list[list[int]] | None = None,
     ):
         super().__init__(
-            model=model,
             support_dataset=support_dataset,
             grouping_strategy=grouping_strategy,
             subsets_generation_strategy=subsets_generation_strategy,
@@ -465,8 +520,8 @@ class FastShaTS(ShaTS):
         test_dataset: list[Tensor]
     ) -> Tensor:
         tsgshapvalues_list = torch.zeros(
-        len(test_dataset), 
-        self.groups_num, 
+        len(test_dataset),
+        self.groups_num,
         self.nclass,
         device=self.device
         )
@@ -514,11 +569,10 @@ class FastShaTS(ShaTS):
                 )
 
         return tsgshapvalues_list
-    
 
     def _reverse_dict(
-        self, 
-        subsets_dict: dict[Any, Any], 
+        self,
+        subsets_dict: dict[Any, Any],
         subsets_total: list[Any]
     ) -> dict[tuple[Any], list[Any]]:
         subsets_dict_reversed = dict[tuple[Any], list[Any]]()
