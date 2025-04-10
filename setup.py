@@ -16,7 +16,7 @@ setup(
     description="Package ShaTS (Shapley values for Time Series)",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/ManuelFranco/TSG-SHAP",
+    url="https://github.com/CyberDataLab/ShaTS",
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
