@@ -5,7 +5,7 @@ import math
 import random
 from enum import Enum
 from typing import NamedTuple
-
+import itertools
 import numpy as np
 
 class StrategySubsets(Enum):
@@ -190,3 +190,76 @@ def estimate_m(total_features: int, total_desired_subsets: int) -> int:
         return limit
 
     return round(m)
+
+
+def generate_subsets_alternative(num_groups: int, num_subsets: int, max_size: int):
+    """
+    Generate subsets of size up to max_size containing a specific group.
+    Additionally, generate subsets for sizes (M, M-1, ..., M-max_size) with M = num_groups.
+ 
+    Args:
+        num_groups (int): Number of groups.
+        num_subsets (int): Number of subsets to generate for each group and size.
+        max_size (int): Maximum subset size for generation.
+ 
+    Returns:
+        Tuple:
+            - A dictionary where keys are (group, size) for size in {1, ..., max_size} and (M, M-1, ..., M-max_size),
+              and values are lists of subsets containing the group.
+            - A flattened list of all unique subsets generated, without repetitions.
+    """
+    subset_dict = {}
+    flattened_subsets = set()
+    flattened_subsets.add(tuple())
+    #If max_size is greater than the number of groups, we can generate all combinations  
+    if max_size > num_groups // 2:
+        all_subsets = [list(subset) for i in range(1, num_groups + 1) for subset in itertools.combinations(range(num_groups), i)]
+        
+        # Filling the dictionary with all possible combinations
+        for group in range(num_groups):
+            for subset in all_subsets:
+                if group in subset:
+                    key = (group, len(subset))
+                    if key not in subset_dict:
+                        subset_dict[key] = []
+                    subset_dict[key].append(subset)
+        
+        return subset_dict, all_subsets
+ 
+    for group in range(num_groups):
+        remaining_numbers = [g for g in range(num_groups) if g != group]
+ 
+        # Subsets of sizes 1 to max_size
+        for size in range(1, max_size + 1):
+            limited_subsets = set()
+            attempts = 0
+            max_attempts = 10 * num_subsets
+ 
+            while len(limited_subsets) < num_subsets and attempts < max_attempts:
+                subset = random.sample(remaining_numbers, size - 1)
+                subset.append(group)
+                limited_subsets.add(tuple(sorted(subset)))
+                attempts += 1
+ 
+            subset_dict[(group, size)] = [list(subset) for subset in limited_subsets]
+            flattened_subsets.update(limited_subsets)
+ 
+        # Subsets of sizes M to M- max_size
+        M = num_groups
+        for size in range(M, M - max_size - 1, -1):
+            limited_subsets = set()
+            attempts = 0
+            max_attempts = 10 * num_subsets
+ 
+            while len(limited_subsets) < num_subsets and attempts < max_attempts:
+                subset = random.sample(remaining_numbers, size - 1)
+                subset.append(group)
+                limited_subsets.add(tuple(sorted(subset)))
+                attempts += 1
+ 
+            subset_dict[(group, size)] = [list(subset) for subset in limited_subsets]
+            flattened_subsets.update(limited_subsets)
+ 
+    # Ensure all groups are represented in flattened_subsets without duplicates
+    unique_flattened_subsets = {tuple(subset) for subset in flattened_subsets}
+    return subset_dict, [list(subset) for subset in unique_flattened_subsets]
