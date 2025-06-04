@@ -164,7 +164,8 @@ If you use ShaTS in a scientific publication, we would appreciate using the foll
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2506.01450}, 
 }
-``
+```
+
 # Contact & Support
 For questions or support, contact the author:
 - Manuel Franco de la Peña (manuel.francop@um.es)
