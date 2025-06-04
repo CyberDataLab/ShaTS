@@ -152,7 +152,17 @@ This project is licensed under the [MIT License](LICENSE).
 
 # Citation
 
+If you use ShaTS in a scientific publication, we would appreciate using the following citation:
 
+@misc{2025shats,
+      title={ShaTS: A Shapley-based Explainability Method for Time Series Artificial Intelligence Models applied to Anomaly Detection in Industrial Internet of Things},
+      author={Manuel Franco de la Peña and Ángel Luis Perales Gómez and Lorenzo Fernández Maimó},
+      year={2025},
+      eprint={2506.01450},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2506.01450}, 
+}
 
 # Contact & Support
 For questions or support, contact the author:
