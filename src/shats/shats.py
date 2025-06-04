@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 from typing import Callable
 from abc import ABC, abstractmethod
-
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -19,8 +20,7 @@ from .grouping import (
     MultifeaturesGroupingStrategy,
     TimeGroupingStrategy)
 
-from .utils import StrategySubsets, estimate_m, generate_subsets
-
+from .utils import StrategySubsets, estimate_m, generate_subsets, generate_subsets_alternative
 
 class ShaTS(ABC):
     """
@@ -588,3 +588,140 @@ class FastShaTS(ShaTS):
                     subsets_dict_reversed[tuple(subset)].append((clave, 1))
 
         return subsets_dict_reversed
+
+class KernelShaTS(ShaTS):
+    """
+    Kernel-based implementation of the ShaTS algorithm.
+    This implementation uses a kernel regression model to compute the Shapley values."""
+    def __init__(
+        self,
+        model_wrapper: Callable[[Tensor], Tensor],
+        support_dataset: list[Tensor],
+        grouping_strategy: str | AbstractGroupingStrategy,
+        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
+        m: int = 5,
+        max_size = 2,
+        batch_size: int = 32,
+        device: str | torch.device | int = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ),
+        custom_groups: list[list[int]] | None = None,
+    ):
+        super().__init__(
+            support_dataset=support_dataset,
+            grouping_strategy=grouping_strategy,
+            subsets_generation_strategy=subsets_generation_strategy,
+            m=m,
+            batch_size=batch_size,
+            device=device,
+            custom_groups=custom_groups,
+            model_wrapper=model_wrapper
+        )
+        self.max_size = max_size
+        self.subsets_dict, self.all_subsets = generate_subsets_alternative(num_groups=self.groups_num,
+                                                                           num_subsets =self.m,
+                                                                           max_size=self.max_size)
+        self.binary_vectors = self._subsets_to_binary_vectors()
+        self.weights = self._compute_weigths()
+ 
+        #  Each subset generated is paired with each entity in the support dataset
+        self.keys_support_subsets = [(tuple(subset), entity) for subset in self.all_subsets for entity in range(len(self.support_dataset))]
+        
+        # Dictionary to map each pair to an index
+        self.pair_dicts = {(subset, entity): i for i, (subset, entity) in enumerate(self.keys_support_subsets)}
+ 
+    def compute(
+        self,
+        test_dataset: list[Tensor],
+        learning_rate: float = 0.01,
+        early_stopping_rate: float = 0.1,
+        num_epochs: int = 10,
+    ) -> Tensor:
+        tsgshapvalues_list = torch.zeros(
+        len(test_dataset),
+        self.groups_num,
+        self.nclass,
+        device=self.device,
+    )
+ 
+        def weighted_loss(y_true, y_pred, weights):
+            return torch.sum(weights * (y_true - y_pred) ** 2)
+        
+ 
+        class WeightedLinearRegression(nn.Module):
+            """
+            Modelo de regresión lineal ponderada."""
+            def __init__(self, input_dim):
+                super(WeightedLinearRegression, self).__init__()
+                self.linear = nn.Linear(input_dim, 1)
+        
+            def forward(self, x):
+                return self.linear(x)
+        
+ 
+        tsgshapvalues_list = torch.zeros(len(test_dataset), self.groups_num, device=self.device)
+        regression_model = WeightedLinearRegression(input_dim=self.binary_vectors.shape[1]).to(self.device)
+        optimizer = optim.Adam(regression_model.parameters(), learning_rate)
+ 
+        weights_tensor = torch.tensor(self.weights, dtype=torch.float32, device=self.device, requires_grad=False)
+ 
+        last_loss = 0.01
+        for idx, data in enumerate(test_dataset):
+            with torch.no_grad():
+                modified_data_batches = self._modify_data_batches(data)
+                probs = self._compute_probs(modified_data_batches)
+ 
+            prediccion = torch.zeros(len(self.all_subsets), device=self.device)
+            for i, subset in enumerate(self.all_subsets):
+                indexes = [self.pair_dicts[(tuple(subset), entity)] for entity in range(len(self.support_dataset))]
+                prediccion[i] = probs[0][indexes].mean()
+ 
+            target = prediccion.unsqueeze(1).to(self.device)
+ 
+ 
+            for _ in range(num_epochs):
+                optimizer.zero_grad()
+                pred = regression_model(torch.tensor(self.binary_vectors, dtype=torch.float32).to(self.device))
+ 
+                loss = weighted_loss(pred, target, weights_tensor)
+ 
+                loss.backward()
+                upgrade = abs(last_loss - loss.item()) / last_loss
+                if upgrade < early_stopping_rate:
+                    break
+                last_loss = loss.item()
+                optimizer.step()
+ 
+            raw_weights = regression_model.linear.weight.detach().cpu().numpy().flatten()        
+ 
+            tsgshapvalues = -raw_weights
+            tsgshapvalues_list[idx] = torch.tensor(tsgshapvalues, device=self.device)
+ 
+            del modified_data_batches, probs
+            torch.cuda.empty_cache()
+ 
+        return (tsgshapvalues_list)
+ 
+    def _subsets_to_binary_vectors(self):
+        
+        binary_vectors = np.zeros((len(self.all_subsets), self.groups_num), dtype=int)
+ 
+        for i, subset in enumerate(self.all_subsets):
+            binary_vectors[i, subset] = 1
+ 
+        return binary_vectors
+    
+    def _compute_weigths(self):
+        weights = []
+        M = self.groups_num
+        
+        for coalition in self.binary_vectors:
+            z_prime_size = sum(coalition)
+            
+            if z_prime_size == 0 or z_prime_size == M:
+                weights.append(0)
+            else:
+                weight = (M - 1) / (math.comb(M, z_prime_size) * z_prime_size * (M - z_prime_size))
+                weights.append(weight)
+        
+        return weights
