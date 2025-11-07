@@ -7,7 +7,7 @@
 
 # Description
 
-ShaTS (Shapley values for Time Series models) is a Shapley-based xAI method specifically designed for **time series Machine Learning (ML) and Deep Learning (DL) PyTorch models**. Unlike traditional Shapley methods, ShaTS applies **a priori feature grouping strategies** to preserve the temporal dependencies inherent in time-series data, thereby delivering coherent and actionable explanations that assist in pinpointing critical time instants and identifying important features or impacted physical components.
+ShaTS (Shapley values for Time Series models) is a Shapley-based xAI method specifically designed for **time series Machine Learning (ML) and Deep Learning (DL) PyTorch/Keras models**. Unlike traditional Shapley methods, ShaTS applies **a priori feature grouping strategies** to preserve the temporal dependencies inherent in time-series data, thereby delivering coherent and actionable explanations that assist in pinpointing critical time instants and identifying important features or impacted physical components.
 
 This repository includes:
 - The **ShaTS library** as Python module.
@@ -90,7 +90,7 @@ from shats.grouping import MultifeaturesGroupingStrategy
 
 ### 2. Initialize the Model and Data
 
-Assume you have a pre-trained time series PyTorch model and a background dataset, which should be a list of tensors representing typical data samples that the model has seen during training.
+Assume you have a pre-trained time series PyTorch model (if you would like to see the steps for a Keras model go to [keras example](tests/example_keras/)) and a background dataset, which should be a list of tensors representing typical data samples that the model has seen during training.
 
 ```python
 model = MyTrainedModel()
@@ -106,14 +106,14 @@ shapley_class = shats.FastShaTS(model,
 Once the explainer is initialized, compute the ShaTS values for your test dataset. The test dataset should be formatted similarly to the support dataset.
 ```python
 testDataset = [...] 
-tsgshap_values = shaTS.compute(testDataset)
+shats_values = shaTS.compute(testDataset)
 ```
 
 ### 4. Visualize Results
 ShaTS includes a plotting function to help visualize the Shapley value attributions. This visualization uses a heatmap to display the contribution of each group (depending on the chosen strategy) over time. The plot also overlays the model’s predicted probability to facilitate interpretation.
 
 ```python
-shaTS.plot(tsgshap_values, test_dataset=testDataset, class_to_explain=1)
+shaTS.plot(shats_values, test_dataset=testDataset, class_to_explain=1)
 ```
 
 
@@ -139,10 +139,30 @@ The repository is organized as follows:
     ├── example_SWaT
     │   ├── ADmodel.pt       # Trained model for SWaT
     │   └── example.ipynb    # Usage example with SWaT
-    └── example_toy_dataset
-        ├── SinteticModel.pt # Trained model on toy dataset
-        └── example.ipynb    # Usage example with toy dataset
+    ├── example_toy_dataset
+    │   ├── SinteticModel.pt # Trained model on toy dataset
+    │   └── example.ipynb    # Usage example with toy dataset
+    └── example_keras
+        ├── KerasModel.h5    # Trained model on Keras
+        ├── example.ipynb    # Usage example with toy dataset
+        └── requirements.txt # Specific requirements
 ```
+
+# Web demo
+An interactive [demo](https://shats-lab.ovh/) has been developed for comparing ShaTS again post hoc SHAP on synthetic time-series scenarios.
+
+On the site, you can compare performance and explanations between post-hoc SHAP (with grouping) and ShaTS. By grouping features a priori across time/sensors, ShaTS preserves temporal dependencies and yields clearer, time-localized attributions for anomalies.
+
+1. 📊 Data → Generate a synthetic 3-variable time series with temporal dependencies and inject several anomaly types.
+
+2. 💻 Train → Fit an LSTM anomaly detector on the dataset you created.
+
+3. 🔎 Evaluate → Assess how well the model performs.
+
+4. ⚠️ Explain → Compare ShaTS explanations against post-hoc SHAP for any selected anomaly.
+
+
+<video src="./shats_webdemo.mp4" width="1280" height="720" controls></video>
 
 
 # License
@@ -155,15 +175,15 @@ This project is licensed under the [MIT License](LICENSE).
 If you use ShaTS in a scientific publication, we would appreciate using the following citation:
 
 ```bibtex
-@misc{2025shats,
-      title={ShaTS: A Shapley-based Explainability Method for Time Series Artificial Intelligence Models applied to Anomaly Detection in Industrial Internet of Things}, 
-      author={Manuel Franco de la Peña and Ángel Luis Perales Gómez and Lorenzo Fernández Maimó},
-      year={2025},
-      eprint={2506.01450},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2506.01450}, 
+@article{de2025shats,
+  title={ShaTS: A Shapley-based Explainability Method for Time Series Artificial Intelligence Models},
+  author={Franco de la Pe{\~n}a, Manuel and Perales G{\'o}mez, {\'A}ngel Luis and Fernández Maim{\'o}, Lorenzo},
+  journal={Future Generation Computer Systems},
+  pages={108178},
+  year={2025},
+  publisher={Elsevier}
 }
+
 ```
 
 # Contact & Support
