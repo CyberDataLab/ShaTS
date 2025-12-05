@@ -20,7 +20,7 @@ from .grouping import (
     MultifeaturesGroupingStrategy,
     TimeGroupingStrategy)
 
-from .utils import StrategySubsets, estimate_m, generate_subsets, generate_subsets_alternative
+from .utils import StrategySubsets, estimate_m, generate_subsets
 
 class ShaTS(ABC):
     """
@@ -560,7 +560,7 @@ class FastShaTS(ShaTS):
                                 tsgshapvalues[v[0][0]][class_idx] += add / len(
                                     self.subsets_dict[(v[0][0], v[0][1])][0]
                                 )
-                    tsgshapvalues_list[idx] = tsgshapvalues.clone()
+                    tsgshapvalues_list[idx] = -tsgshapvalues.clone()
 
                 del (
                     modified_data_batches,
@@ -600,7 +600,6 @@ class KernelShaTS(ShaTS):
         grouping_strategy: str | AbstractGroupingStrategy,
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
         m: int = 5,
-        max_size = 2,
         batch_size: int = 32,
         device: str | torch.device | int = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -617,18 +616,20 @@ class KernelShaTS(ShaTS):
             custom_groups=custom_groups,
             model_wrapper=model_wrapper
         )
-        self.max_size = max_size
-        self.subsets_dict, self.all_subsets = generate_subsets_alternative(num_groups=self.groups_num,
-                                                                           num_subsets =self.m,
-                                                                           max_size=self.max_size)
+
+        self.keys_support_subsets = [
+            (tuple(subset), entity)
+            for subset in self.all_subsets
+            for entity in range(len(self.support_dataset))
+        ]
+        self.pair_dicts = {
+            (subset, entity): i
+            for i, (subset, entity) in enumerate(self.keys_support_subsets)
+        }
+
         self.binary_vectors = self._subsets_to_binary_vectors()
         self.weights = self._compute_weigths()
  
-        #  Each subset generated is paired with each entity in the support dataset
-        self.keys_support_subsets = [(tuple(subset), entity) for subset in self.all_subsets for entity in range(len(self.support_dataset))]
-        
-        # Dictionary to map each pair to an index
-        self.pair_dicts = {(subset, entity): i for i, (subset, entity) in enumerate(self.keys_support_subsets)}
  
     def compute(
         self,
@@ -694,7 +695,7 @@ class KernelShaTS(ShaTS):
  
             raw_weights = regression_model.linear.weight.detach().cpu().numpy().flatten()        
  
-            tsgshapvalues = -raw_weights
+            tsgshapvalues = raw_weights
             tsgshapvalues_list[idx] = torch.tensor(tsgshapvalues, device=self.device)
  
             del modified_data_batches, probs
@@ -725,3 +726,224 @@ class KernelShaTS(ShaTS):
                 weights.append(weight)
         
         return weights
+
+class CachedKernelShaTS:
+    """
+    Meta-explainer que envuelve a KernelShaTS y reutiliza explicaciones
+    cuando las ventanas son muy parecidas (globalmente o por grupo).
+
+    API:
+        compute(test_dataset, learning_rate, early_stopping_rate, num_epochs)
+        -> Tensor de shape [N, groups_num, nclass]
+    """
+
+    def __init__(
+        self,
+        model_wrapper: Callable[[Tensor], Tensor],
+        support_dataset: list[Tensor],
+        grouping_strategy: str | AbstractGroupingStrategy,
+        m: int = 5,
+        batch_size: int = 32,
+        device: str | torch.device | int = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ),
+        custom_groups: list[list[int]] | None = None,
+        # Parámetros nuevos para aprovechar repetición
+        global_similarity_threshold: float = 0.01,
+        group_change_threshold: float = 0.01,
+        max_cache_size: int = 1000,
+        hash_decimals: int = 3,
+    ) -> None:
+        # Explainer base: el que realmente calcula los Shapley cuando hace falta
+        self.base_explainer = KernelShaTS(
+            model_wrapper=model_wrapper,
+            support_dataset=support_dataset,
+            grouping_strategy=grouping_strategy,
+            subsets_generation_strategy=StrategySubsets.APPROX,
+            m=m,
+            batch_size=batch_size,
+            device=device,
+            custom_groups=custom_groups,
+        )
+
+        self.device = device
+        self.groups_num = self.base_explainer.groups_num
+        self.nclass = self.base_explainer.nclass
+        self.grouping_strategy = self.base_explainer.grouping_strategy
+        self.global_similarity_threshold = global_similarity_threshold
+        self.group_change_threshold = group_change_threshold
+        self.max_cache_size = max_cache_size
+        self.hash_decimals = hash_decimals
+
+        # Caché: hash(data) -> shap_values [groups_num, nclass]
+        self._cache: dict[int, Tensor] = {}
+        self._cache_keys: list[int] = []  
+
+    # ---------- Utilidades internas ----------
+
+    def _hash_tensor(self, data: Tensor) -> int:
+        """
+        Hash simple del tensor, redondeando a ciertos decimales para agrupar
+        ventanas muy parecidas.
+        """
+        arr = data.detach().cpu().numpy()
+        arr = np.round(arr, decimals=self.hash_decimals)
+        return hash(arr.tobytes())
+
+    def _global_change(self, x_new: Tensor, x_old: Tensor) -> float:
+        """
+        Cambio relativo global entre dos ventanas.
+        """
+        diff = (x_new - x_old).detach().cpu().numpy()
+        old = x_old.detach().cpu().numpy()
+        num = np.linalg.norm(diff)
+        den = np.linalg.norm(old) + 1e-8
+        return float(num / den)
+
+    def _per_group_change(self, x_new: Tensor, x_old: Tensor) -> np.ndarray:
+        """
+        Cambio medio por grupo, según la estrategia de agrupamiento.
+        Devuelve un array de shape [groups_num].
+        """
+        x_new_np = x_new.detach().cpu().numpy()
+        x_old_np = x_old.detach().cpu().numpy()
+        changes = np.zeros(self.groups_num, dtype=float)
+
+        from .grouping import TimeGroupingStrategy, FeaturesGroupingStrategy, MultifeaturesGroupingStrategy
+
+        # Caso 1: agrupación temporal (cada grupo = un instante)
+        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
+            # groups_num == window_size
+            for g in range(self.groups_num):
+                diff = x_new_np[g, :] - x_old_np[g, :]
+                base = x_old_np[g, :]
+                num = np.linalg.norm(diff)
+                den = np.linalg.norm(base) + 1e-8
+                changes[g] = num / den
+
+        # Caso 2: agrupación por feature (cada grupo = una feature)
+        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
+            # groups_num == num_features
+            for g in range(self.groups_num):
+                diff = x_new_np[:, g] - x_old_np[:, g]
+                base = x_old_np[:, g]
+                num = np.linalg.norm(diff)
+                den = np.linalg.norm(base) + 1e-8
+                changes[g] = num / den
+
+        # Caso 3: multifeature (cada grupo = conjunto de features)
+        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
+            custom_groups = self.grouping_strategy._custom_groups  # ya está en tu clase
+            for g, feat_idxs in enumerate(custom_groups):
+                diff = x_new_np[:, feat_idxs] - x_old_np[:, feat_idxs]
+                base = x_old_np[:, feat_idxs]
+                num = np.linalg.norm(diff)
+                den = np.linalg.norm(base) + 1e-8
+                changes[g] = num / den
+
+        else:
+            # Fallback simple: mismo cambio global para todos los grupos
+            glob = self._global_change(x_new, x_old)
+            changes[:] = glob
+
+        return changes
+
+    def _get_from_cache(self, key: int) -> Tensor | None:
+        return self._cache.get(key, None)
+
+    def _store_in_cache(self, key: int, shap: Tensor) -> None:
+        if key in self._cache:
+            return
+        if len(self._cache_keys) >= self.max_cache_size:
+            # Política FIFO: borramos el más antiguo
+            old_key = self._cache_keys.pop(0)
+            self._cache.pop(old_key, None)
+        self._cache[key] = shap.detach().clone()
+        self._cache_keys.append(key)
+
+    # ---------- Método principal ----------
+
+    def compute(
+        self,
+        test_dataset: list[Tensor],
+        learning_rate: float = 0.01,
+        early_stopping_rate: float = 0.1,
+        num_epochs: int = 10,
+    ) -> Tensor:
+        """
+        Calcula ShaTS con KernelShaTS, pero reutilizando explicaciones
+        cuando las ventanas son muy parecidas.
+
+        Devuelve: Tensor [N, groups_num, nclass]
+        """
+        N = len(test_dataset)
+        shats_values_list = torch.zeros(
+            N, self.groups_num, self.nclass, device=self.device
+        )
+
+        prev_x: Tensor | None = None
+        prev_shap: Tensor | None = None
+
+        for idx, data in enumerate(test_dataset):
+            data = data.to(self.device)
+            key = self._hash_tensor(data)
+
+            # 1) Intento caché
+            shap = self._get_from_cache(key)
+            if shap is not None:
+                shats_values_list[idx] = shap
+                prev_x, prev_shap = data, shap
+                continue
+
+            # 2) Si tengo ventana anterior, compruebo similitud global
+            if prev_x is not None and prev_shap is not None:
+                g_change = self._global_change(data, prev_x)
+                if g_change < self.global_similarity_threshold:
+                    # Ventana muy parecida: reutilizo explicación entera
+                    shats_values_list[idx] = prev_shap
+                    self._store_in_cache(key, prev_shap)
+                    prev_x, prev_shap = data, prev_shap
+                    continue
+
+            # 3) Calculo explicación base con KernelShaTS
+            base_result = self.base_explainer.compute(
+                [data],
+                learning_rate=learning_rate,
+                early_stopping_rate=early_stopping_rate,
+                num_epochs=num_epochs,
+            )
+            # base_result shape actual de KernelShaTS: [1, groups_num] (solo clase 0)
+            base_shap = base_result[0]  # [groups_num] o [groups_num, nclass?]
+
+            # Aseguramos shape [groups_num, nclass]
+            if base_shap.dim() == 1:
+                # Solo explica la clase 0: la ponemos en [:,0] y el resto a 0
+                tmp = torch.zeros(self.groups_num, self.nclass, device=self.device)
+                tmp[:, 0] = base_shap
+                base_shap = tmp
+            elif base_shap.dim() == 2 and base_shap.shape[1] != self.nclass:
+                # Por si en un futuro cambias KernelShaTS: nos adaptamos
+                # Reescalamos a nclass con padding de ceros si hace falta
+                tmp = torch.zeros(self.groups_num, self.nclass, device=self.device)
+                cols = min(self.nclass, base_shap.shape[1])
+                tmp[:, :cols] = base_shap[:, :cols]
+                base_shap = tmp
+
+            # 4) Refinamiento por grupo: copiar grupos casi iguales de la ventana anterior
+            if prev_x is not None and prev_shap is not None:
+                per_group_change = self._per_group_change(data, prev_x)  # [groups_num]
+                base_np = base_shap.detach().cpu().numpy()
+                prev_np = prev_shap.detach().cpu().numpy()
+
+                mask_copy = per_group_change < self.group_change_threshold
+                base_np[mask_copy, :] = prev_np[mask_copy, :]
+
+                base_shap = torch.tensor(
+                    base_np, device=self.device, dtype=base_shap.dtype
+                )
+
+            shats_values_list[idx] = base_shap
+            self._store_in_cache(key, base_shap)
+            prev_x, prev_shap = data, base_shap
+
+        return shats_values_list

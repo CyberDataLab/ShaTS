@@ -10,3 +10,6 @@ __pycache__/
 # Data
 experiments/
 tsg_shap/
+results_shats/
+pruebas_laura/
+ShaTS/pruebas_laura/
