@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import Tensor
+import time
 
 from .grouping import (
     AbstractGroupingStrategy,
@@ -947,3 +948,386 @@ class CachedKernelShaTS:
             prev_x, prev_shap = data, base_shap
 
         return shats_values_list
+
+
+
+##IG Explainer
+
+def _build_group_directions(
+    x: Tensor,
+    baseline: Tensor,
+    grouping_strategy: AbstractGroupingStrategy,
+) -> Tensor:
+    """
+    Construye d_stack[g] = (x - baseline) restringido al grupo g.
+
+    x: [T, F]
+    baseline: [T, F]
+    return: [G, T, F]
+    """
+    diff = x - baseline  # [T, F]
+    T, F = diff.shape
+    G = grouping_strategy.groups_num
+
+    d_stack = torch.zeros(G, T, F, device=x.device, dtype=x.dtype)
+
+    if isinstance(grouping_strategy, TimeGroupingStrategy):
+        # grupo g = instante g, todas las features
+        for g in range(G):
+            d_stack[g, g, :] = diff[g, :]
+
+    elif isinstance(grouping_strategy, FeaturesGroupingStrategy):
+        # grupo g = feature g, todos los tiempos
+        for g in range(G):
+            d_stack[g, :, g] = diff[:, g]
+
+    elif isinstance(grouping_strategy, MultifeaturesGroupingStrategy):
+        custom_groups = grouping_strategy._custom_groups
+        for g, feat_idxs in enumerate(custom_groups):
+            d_stack[g, :, feat_idxs] = diff[:, feat_idxs]
+
+    else:
+        # Fallback: todo el diff en cada grupo
+        for g in range(G):
+            d_stack[g] = diff
+
+    return d_stack  # [G, T, F]
+
+
+def integrated_gradients_groups_direct(
+    model_wrapper: Callable[[Tensor], Tensor],
+    x: Tensor,                          # [T, F]
+    baseline: Tensor,                   # [T, F]
+    grouping_strategy: AbstractGroupingStrategy,
+    class_idx: int = 0,
+    steps: int = 50,
+    device: torch.device | str = "cpu",
+) -> Tensor:
+    """
+    Integrated Gradients directamente a nivel de grupo.
+
+    Devuelve: Tensor [groups_num] con la atribución de cada grupo
+    para la clase class_idx.
+    """
+    device = torch.device(device)
+    x = x.to(device)
+    baseline = baseline.to(device)
+
+    # 1) Direcciones por grupo
+    d_stack = _build_group_directions(x, baseline, grouping_strategy)  # [G, T, F]
+    G, T, F = d_stack.shape
+
+    # 2) Acumulador de gradientes respecto a alpha (uno por grupo)
+    grad_alpha_sum = torch.zeros(G, device=device)
+
+    # 3) Integramos alpha de 0 a 1 (todos los grupos escalan a la vez)
+    alphas = torch.linspace(0.0, 1.0, steps, device=device)
+
+    for alpha_scalar in alphas:
+        # alpha: [G], mismo escalar para todos los grupos
+        alpha = torch.full((G,), alpha_scalar, device=device, requires_grad=True)
+
+        x_alpha = baseline + torch.tensordot(alpha, d_stack, dims=1)  # [T, F]
+        x_alpha_batch = x_alpha.unsqueeze(0)  # [1, T, F] para el modelo
+
+        out = model_wrapper(x_alpha_batch)  # [1, nclass]
+        target = out[0, class_idx]
+
+        if alpha.grad is not None:
+            alpha.grad.zero_()
+        target.backward()
+        grad_alpha_sum += alpha.grad.detach()
+
+    # IG por grupo = media de grad_alpha (delta_alpha = 1)
+    ig_groups = grad_alpha_sum / steps  # [G]
+
+    return ig_groups
+
+
+
+class FastShaTSIG(FastShaTS):
+    """
+    Variante de FastShaTS que explota la continuidad temporal:
+
+    - En el primer instante (y cada `force_full_every` pasos) calcula
+      FastShaTS completo.
+    - Entre medias, si la distancia entre x_t y x_{t-1} es pequeña,
+      actualiza las explicaciones como:
+
+          phi_t ≈ phi_{t-1} + IG(x_{t-1} -> x_t) * ig_lambda
+
+      (IG agrupado por grupos ShaTS).
+
+    - Si la distancia entre x_t y x_{t-1} es grande, fuerza un
+      recálculo completo de FastShaTS.
+
+    """
+
+    def __init__(
+        self,
+        model_wrapper: Callable[[Tensor], Tensor],
+        grad_model_wrapper: Callable[[Tensor], Tensor],
+        support_dataset: list[Tensor],
+        grouping_strategy: str | AbstractGroupingStrategy,
+        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
+        m: int = 5,
+        batch_size: int = 32,
+        device: str | torch.device | int = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ),
+        custom_groups: list[list[int]] | None = None,
+        # Hiperparámetros IG / temporal
+        distance_threshold: float = 0.05,
+        pred_distance_threshold: float | None = None,
+        recalculation_mode: str = "x",  # "x" | "pred" | "x_or_pred"
+        force_full_every: int = 100,
+        ig_steps: int = 32,
+        ig_lambda: float = 1.0,
+        ig_class_idx: int = 1,
+    ) -> None:
+        super().__init__(
+            model_wrapper=model_wrapper,
+            support_dataset=support_dataset,
+            grouping_strategy=grouping_strategy,
+            subsets_generation_strategy=subsets_generation_strategy,
+            m=m,
+            batch_size=batch_size,
+            device=device,
+            custom_groups=custom_groups,
+        )
+
+        self.grad_model_wrapper = grad_model_wrapper
+        self.distance_threshold = distance_threshold
+        self.pred_distance_threshold = None if pred_distance_threshold is None else float(pred_distance_threshold)
+        self.recalculation_mode = recalculation_mode
+        self.force_full_every = force_full_every
+        self.ig_steps = ig_steps
+        self.ig_lambda = ig_lambda
+        self.ig_class_idx = ig_class_idx
+
+    # ----------------- utilidades internas -----------------
+
+    def _input_distance(self, x_new: Tensor, x_old: Tensor) -> float:
+        """
+        Distancia relativa global entre dos ventanas.
+        """
+        diff = x_new - x_old
+        num = torch.norm(diff)
+        den = torch.norm(x_old) + 1e-8
+        return float((num / den).item())
+    
+    def _pred_distance(self, x_prev: torch.Tensor, x_curr: torch.Tensor) -> float:
+        # model_wrapper devuelve probs [B,C] 
+        with torch.no_grad():
+            p_prev = self.model_wrapper(x_prev)  # [1,C] o [B,C]
+            p_curr = self.model_wrapper(x_curr)
+        # distancia L1 sobre probabilidades 
+        return float(torch.abs(p_curr - p_prev).sum().item())
+
+
+    def _group_ig_from_tensor(self, ig_tensor: Tensor) -> Tensor:
+        """
+        Dado un tensor IG de forma [T, F] (integrated gradients en el espacio
+        de entrada), lo agrega a nivel de grupo ShaTS.
+
+        Devuelve un tensor [groups_num] (solo para la clase ig_class_idx).
+        """
+        ig_np = ig_tensor.detach().cpu().numpy()
+        group_scores = np.zeros(self.groups_num, dtype=np.float32)
+
+
+        # Caso 1: agrupación temporal (cada grupo = un instante)
+        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
+            # groups_num == window_size
+            for g in range(self.groups_num):
+                # IG del instante g en todas las features
+                group_scores[g] = float(np.sum((ig_np[g, :])))
+
+        # Caso 2: agrupación por feature (cada grupo = una feature)
+        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
+            # groups_num == num_features
+            for g in range(self.groups_num):
+                # IG de todas las time-steps para la feature g
+                group_scores[g] = float(np.sum((ig_np[:, g])))
+
+        # Caso 3: multifeature (cada grupo = conjunto de features)
+        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
+            custom_groups = self.grouping_strategy._custom_groups  # ya existe
+            for g, feat_idxs in enumerate(custom_groups):
+                sub = ig_np[:, feat_idxs]  # [T, |group|]
+                group_scores[g] = float(np.sum((sub)))
+
+        else:
+            # Fallback: todo a un único grupo global
+            total = float(np.sum((ig_np)))
+            group_scores[:] = total / max(self.groups_num, 1)
+
+        return torch.tensor(group_scores, device=self.device)
+
+
+    def _build_group_directions_like_shats(self, x: Tensor, baseline: Tensor) -> Tensor:
+        """
+        d_stack[g] = (x - baseline) restringido al grupo g.
+        return: [G, T, F]
+        """
+        diff = x - baseline
+        T, F = diff.shape
+        G = self.groups_num
+
+        d_stack = torch.zeros(G, T, F, device=self.device, dtype=x.dtype)
+
+        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
+            for g in range(G):
+                d_stack[g, g, :] = diff[g, :]
+        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
+            for g in range(G):
+                d_stack[g, :, g] = diff[:, g]
+        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
+            custom_groups = self.grouping_strategy._custom_groups
+            for g, feat_idxs in enumerate(custom_groups):
+                d_stack[g, :, feat_idxs] = diff[:, feat_idxs]
+        else:
+            # fallback: reparte el diff entero
+            for g in range(G):
+                d_stack[g] = diff
+
+        return d_stack
+
+
+
+
+    def _integrated_gradients_groups(
+        self,
+        x_start: Tensor,
+        x_end: Tensor,
+    ) -> Tensor:
+        """
+        IG a lo largo de la recta x(alpha) = x_start + alpha * (x_end - x_start),
+        agregando luego a nivel de grupo ShaTS.
+
+        Devuelve un tensor [groups_num] con la contribución para la clase
+        self.ig_class_idx.
+        """
+        # x_start, x_end: [T, F]
+        x_start = x_start.to(self.device)
+        x_end = x_end.to(self.device)
+
+        # Recta en el input space
+        alphas = torch.linspace(
+            0.0, 1.0, steps=self.ig_steps, device=self.device
+        ).view(-1, 1, 1)  # [S,1,1]
+        direction = (x_end - x_start).unsqueeze(0)  # [1,T,F]
+        path = x_start.unsqueeze(0) + alphas * direction  # [S,T,F]
+        path.requires_grad_(True)
+
+        # forward
+        probs = self.grad_model_wrapper(path)  # [S, C] (S = ig_steps)
+        # sumamos todas las alphas para obtener un escalar y poder llamar a autograd
+        target = probs[:, self.ig_class_idx].sum()
+
+        grads = torch.autograd.grad(target, path)[0]  # [S,T,F]
+        avg_grads = grads.mean(dim=0)  # [T,F]
+
+        ig_tensor = direction.squeeze(0) * avg_grads  # [T,F]
+
+        # Agregamos por grupo
+        group_ig = self._group_ig_from_tensor(ig_tensor)  # [groups_num]
+        return group_ig
+
+    def _compute_full_shap_single(self, x: Tensor) -> Tensor:
+        """
+        Calcula FastShaTS 'completo' para UNA sola ventana x (forma [T,F]).
+        Devuelve [groups_num, nclass].
+        """
+        # super().compute espera una lista de tensores
+        with torch.no_grad():
+            full = super().compute([x])  # [1, G, C]
+        return full[0]  # [G, C]
+   
+    def compute(self, test_dataset: list[Tensor], return_diagnostics: bool = False):
+        N = len(test_dataset)
+        shats_values = torch.zeros(N, self.groups_num, self.nclass, device=self.device)
+
+        prev_x: Tensor | None = None
+        prev_shap: Tensor | None = None
+
+        times: list[float] = [0.0] * N
+        approx_flags: list[bool] = [False] * N  # True si fue IG/reuso, False si full
+
+        full_recomputes = 0
+        ig_updates = 0
+
+        t_global = time.perf_counter()
+        ema = None
+
+        for idx, x in enumerate(test_dataset):
+            x = x.to(self.device)
+
+            t0 = time.perf_counter()
+
+            # ---------- decide need_full ----------
+            need_full = False
+            if idx == 0:
+                need_full = True
+            elif self.force_full_every > 0 and (idx % self.force_full_every == 0):
+                need_full = True
+            elif prev_x is None or prev_shap is None:
+                need_full = True
+            else:
+                dist_x = self._input_distance(x, prev_x)
+                dist_p = None
+                if self.pred_distance_threshold is not None:
+                    dist_p = self._pred_distance(prev_x, x)
+
+                mode = getattr(self, "recalculation_mode", "x")
+                if mode == "x":
+                    need_full = (dist_x > self.distance_threshold)
+                elif mode == "pred":
+                    if self.pred_distance_threshold is None or dist_p is None:
+                        need_full = (dist_x > self.distance_threshold)
+                    else:
+                        need_full = (dist_p > self.pred_distance_threshold)
+                elif mode == "x_or_pred":
+                    if self.pred_distance_threshold is None or dist_p is None:
+                        need_full = (dist_x > self.distance_threshold)
+                    else:
+                        need_full = (dist_x > self.distance_threshold) or (dist_p > self.pred_distance_threshold)
+                else:
+                    raise ValueError(f"Unknown recalculation_mode={mode!r}")
+
+            # ---------- ejecuta ----------
+            if need_full:
+                full_recomputes += 1
+                shap_t = self._compute_full_shap_single(x)  # [G,C]
+                prev_x, prev_shap = x, shap_t
+                approx_flags[idx] = False
+            else:
+                ig_updates += 1
+                group_ig = self._integrated_gradients_groups(prev_x, x)  # [G]
+                shap_t = prev_shap.clone()
+                shap_t[:, self.ig_class_idx] = shap_t[:, self.ig_class_idx] + self.ig_lambda * group_ig
+                approx_flags[idx] = True
+
+            shats_values[idx] = shap_t
+
+            t1 = time.perf_counter()
+            times[idx] = (t1 - t0)
+
+            # ---------- progreso + ETA ----------
+            step = times[idx]
+            ema = step if ema is None else (0.1 * step + 0.9 * ema)
+            if ((idx + 1) % 50 == 0) or (idx + 1 == N):
+                elapsed = t1 - t_global
+                eta = ema * (N - (idx + 1))
+                print(
+                    f"\rFastShaTSIG - Processing {idx + 1}/{N} "
+                    f"({(idx + 1) / N * 100.0:.2f}%) | full={full_recomputes} | ig={ig_updates} | "
+                    f"elapsed={elapsed:.1f}s | ETA={eta:.1f}s",
+                    end="",
+                    flush=True,
+                )
+
+        print()
+        if return_diagnostics:
+            return shats_values, times, approx_flags
+        return shats_values

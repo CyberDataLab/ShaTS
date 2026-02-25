@@ -3,7 +3,7 @@ from .grouping import (
     MultifeaturesGroupingStrategy,
     TimeGroupingStrategy,
 )
-from .shats import ShaTS, FastShaTS, ApproShaTS, KernelShaTS
+from .shats import ShaTS, FastShaTS, ApproShaTS, KernelShaTS, FastShaTSIG
 from .utils import StrategySubsets
  
 __all__ = [
@@ -15,5 +15,6 @@ __all__ = [
     "KernelShaTS",
     "StrategySubsets",
     "TimeGroupingStrategy",
+    "FastShaTSIG",
 ]
  
