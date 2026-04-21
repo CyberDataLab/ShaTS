@@ -1,27 +1,61 @@
 """
-Module providing the ShaTS abstract class and two implementations of it: 
-ApproShaTS and FastShaTS.
+Module providing the ShaTS abstract class and its explainers
 """
+from __future__ import annotations
+
 import math
-from pathlib import Path
-from typing import Any
-from typing import Callable
+import time
 from abc import ABC, abstractmethod
-import torch.nn as nn
-import torch.optim as optim
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch import Tensor
-import time
 
 from .grouping import (
     AbstractGroupingStrategy,
     FeaturesGroupingStrategy,
     MultifeaturesGroupingStrategy,
-    TimeGroupingStrategy)
+    TimeGroupingStrategy,
+)
+from .utils import (
+    BackgroundDatasetStrategy,
+    StrategySubsets,
+    estimate_m,
+    generate_subsets,
+    infer_binary_feature_indices,
+    resolve_background_dataset,
+    validate_window_dataset,
+    integrated_gradients_groups_direct
+)
 
-from .utils import StrategySubsets, estimate_m, generate_subsets
+
+def _clear_cuda_cache() -> None:
+    """
+    Clear the CUDA cache when CUDA is available.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class _WeightedLinearRegression(nn.Module):
+    """
+    Weighted linear regression model used by KernelShaTS.
+    """
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Run the regression model.
+        """
+        return self.linear(x)
 
 class ShaTS(ABC):
     """
@@ -29,7 +63,10 @@ class ShaTS(ABC):
 
     Args:
         model_wrapper (Callable[..., Tensor]): A function that wraps the model to be explained and returns the output.
-        support_dataset (list[Tensor]): List of tensors representing the support dataset.
+        background_dataset (Sequence[Tensor] | None): A dataset to be used as background for the explainer. If None, it will be inferred from the train_dataset.
+        train_dataset (Sequence[Tensor] | None): The training dataset, used to infer the background dataset if background_dataset is None.
+        background_dataset_strategy (BackgroundDatasetStrategy): The strategy to infer the background dataset if background_dataset is None.
+        train_labels (Sequence[int] | Tensor | None): The labels of the training dataset, used to infer the background dataset if background_dataset is None and background_dataset_strategy is not RANDOM.
         grouping_strategy (str | AbstractGroupingStrategy): The strategy for grouping features. 
         subsets_generation_strategy (StrategySubsets): The strategy for generating subsets.
         m (int): Number of subsets to be generated.
@@ -41,8 +78,12 @@ class ShaTS(ABC):
     def __init__(
         self,
         model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
+        background_dataset: Sequence[Tensor] | None = None,
+        train_dataset: Sequence[Tensor] | None = None,
+        background_dataset_strategy: BackgroundDatasetStrategy = BackgroundDatasetStrategy.RANDOM,
+        background_size: int | None = None,
+        train_labels: Sequence[int] | Tensor | None = None,
+        grouping_strategy: str | AbstractGroupingStrategy = "time",
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
         m: int = 5,
         batch_size: int = 32,
@@ -50,61 +91,57 @@ class ShaTS(ABC):
             "cuda" if torch.cuda.is_available() else "cpu"
         ),
         custom_groups: list[list[int]] | None = None,
-    ):
-
-        self.support_dataset = support_dataset
-        self.support_tensor = torch.stack(
-            [data for data in support_dataset]
-        ).to(device)
-        self.window_size = support_dataset[0].shape[0]
-        self.num_of_features = support_dataset[0].shape[1]
-        self.subsets_generation_strategy = subsets_generation_strategy
-        self.grouping_strategy : AbstractGroupingStrategy
-
-        if isinstance(grouping_strategy, AbstractGroupingStrategy):
-            self.grouping_strategy = grouping_strategy
-
-        elif grouping_strategy == "time":
-            self.grouping_strategy = TimeGroupingStrategy(
-                groups_num=self.window_size
-            )
-        elif grouping_strategy == "feature":
-            self.grouping_strategy = FeaturesGroupingStrategy(
-                groups_num=self.num_of_features
-            )
-        elif grouping_strategy == "multifeature":
-            if custom_groups is None:
-                raise ValueError(
-                    "custom_groups must be provided when grouping_strategy is 'multifeature'."
-                )
-            self.grouping_strategy = MultifeaturesGroupingStrategy(
-                groups_num=len(custom_groups),
-                custom_groups=custom_groups,
-            )
-        else:
-            raise ValueError(
-                "grouping_strategy must be 'time', 'feature', or 'multifeature'."
-            )
-
+        random_state: int | None = None,
+        entropy_bins: int = 32,
+        kmeans_max_iter: int = 100,
+        kmeans_tolerance: float = 1e-4,
+    ) -> None:
         self.device = device
-        self.batch_size = batch_size
-        self.nclass = model_wrapper(support_dataset[0]).shape[1]
         self.model_wrapper = model_wrapper
+        self.batch_size = batch_size
+        self.subsets_generation_strategy = subsets_generation_strategy
 
-        self.m = estimate_m(self.groups_num, m)
+        self.background_dataset = resolve_background_dataset(
+            background_dataset=background_dataset,
+            train_dataset=train_dataset,
+            background_size=background_size,
+            background_dataset_strategy=background_dataset_strategy,
+            train_labels=train_labels,
+            random_state=random_state,
+            entropy_bins=entropy_bins,
+            kmeans_max_iter=kmeans_max_iter,
+            kmeans_tolerance=kmeans_tolerance,
+        )
+        validate_window_dataset(self.background_dataset, "background_dataset")
 
-        self.subsets_dict, self.all_subsets = generate_subsets(
-            self.groups_num, self.m, self.subsets_generation_strategy
+        self.background_tensor = torch.stack(self.background_dataset, dim=0).to(self.device)
+        self.window_size = self.background_dataset[0].shape[0]
+        self.num_of_features = self.background_dataset[0].shape[1]
+
+        self.grouping_strategy = self._resolve_grouping_strategy(
+            grouping_strategy=grouping_strategy,
+            custom_groups=custom_groups,
         )
 
-        keys_support_subsets = [
+        self.nclass = self._call_model(self.background_dataset[0]).shape[1]
+        self.m = estimate_m(self.groups_num, m)
+
+        generated_subsets = generate_subsets(
+            self.groups_num,
+            self.m,
+            self.subsets_generation_strategy,
+        )
+        self.subsets_dict = generated_subsets.predictors_to_subsets
+        self.all_subsets = generated_subsets.all_subsets
+
+        keys_background_subsets = [
             (tuple(subset), entity)
             for subset in self.all_subsets
-            for entity in range(len(self.support_dataset))
+            for entity in range(len(self.background_dataset))
         ]
         self.pair_dicts = {
-            (subset, entity): i
-            for i, (subset, entity) in enumerate(keys_support_subsets)
+            (subset, entity): index
+            for index, (subset, entity) in enumerate(keys_background_subsets)
         }
 
         self.coefficients_dict = self._generate_coefficients_dict()
@@ -112,109 +149,87 @@ class ShaTS(ABC):
 
     @property
     def groups_num(self) -> int:
-        """Returns the number of groups."""
+        """
+        Return the number of groups defined by the grouping strategy.
+        """
         return self.grouping_strategy.groups_num
 
     @abstractmethod
-    def compute(
-        self,
-        test_dataset: list[Tensor]
-    ) -> Tensor:
-        """ 
-        Computes the ShaTS values for the given test dataset.
-        Args:
-            test_dataset (list[Tensor]): List of tensors representing the test dataset.
-        Returns:
-            Tensor: Computed ShaTS values.
+    def compute(self, test_dataset: Sequence[Tensor]) -> Tensor:
         """
-        raise NotImplementedError()
+        Compute ShaTS values for the given test dataset.
+        """
+        raise NotImplementedError
 
     def plot(
         self,
         shats_values: Tensor,
-        test_dataset: list[Tensor] | None = None,
+        test_dataset: Sequence[Tensor] | None = None,
         predictions: Tensor | None = None,
         path: str | Path | None = None,
         segment_size: int = 100,
         class_to_explain: int = 0,
-    ):
+    ) -> None:
         """
-        Plots the ShaTS values.
-
-        Args:
-            shats_values (Tensor): The computed ShaTS values.
-            test_dataset (list[Tensor], optional): The test dataset related to the shats_values. 
-                                                    Defaults to None.
-            predictions (Tensor, optional): The model predictions of the shats_values. 
-                                            Defaults to None.
-            path (str | Path, optional): Path to save the plot. Defaults to None.
-            segment_size (int, optional): Size of each segment in the plot. Defaults to 100.
-            class_to_explain (int, optional): Class index to explain. Defaults to 0.
-        Raises:
-            ValueError: If both test_dataset and predictions are None, or if both are provided.
+        Plot ShaTS values together with the model output.
         """
-
         if test_dataset is None and predictions is None:
-            raise ValueError(
-                "Either test_dataset or predictions must be provided."
-            )
+            raise ValueError("Either test_dataset or predictions must be provided.")
         if test_dataset is not None and predictions is not None:
-            raise ValueError(
-                "Only one of test_dataset or predictions should be provided."
-            )
-        elif predictions is not None:
-            model_predictions = predictions
-        elif test_dataset is not None:
-            model_predictions = torch.zeros(
-                len(test_dataset), device=self.device
-            )
-            for i, data in enumerate(test_dataset):
-                model_predictions[i] = self.model_wrapper(data)[0][class_to_explain]
-        shats_values = shats_values[:,:, class_to_explain]
+            raise ValueError("Only one of test_dataset or predictions should be provided.")
+
+        if predictions is not None:
+            model_predictions = predictions.detach().cpu().numpy()
+        else:
+            validate_window_dataset(test_dataset, "test_dataset")  # type: ignore[arg-type]
+            model_predictions = np.zeros(len(test_dataset), dtype=float)
+            for index, data in enumerate(test_dataset or []):
+                model_predictions[index] = float(
+                    self._call_model(data)[0, class_to_explain].detach().cpu().item()
+                )
+
+        shats_values = shats_values[:, :, class_to_explain]
         fontsize = 25
         size = shats_values.shape[0]
 
-        arr_plot = np.zeros((self.groups_num, size))
-        arr_prob = np.zeros(size)
+        arr_plot = np.zeros((self.groups_num, size), dtype=float)
+        arr_prob = np.zeros(size, dtype=float)
 
-        for i in range(size):
-            arr_plot[:, i] = shats_values[i].cpu().numpy()
-            arr_prob[i] = model_predictions[i]
+        for index in range(size):
+            arr_plot[:, index] = shats_values[index].detach().cpu().numpy()
+            arr_prob[index] = model_predictions[index]
 
         vmin, vmax = -0.5, 0.5
         cmap = plt.get_cmap("bwr")
 
         n_segments = (size + segment_size - 1) // segment_size
         fig, axs = plt.subplots(
-            n_segments, 1, figsize=(15, 25 * (max(10, self.groups_num) / 36) * n_segments)
-        )  # 15, 25 predictor
+            n_segments,
+            1,
+            figsize=(15, 25 * (max(10, self.groups_num) / 36) * n_segments),
+        )
 
         if n_segments == 1:
             axs = [axs]
 
-        for n in range(n_segments):
-            real_end = min((n + 1) * segment_size, size)
-            if n == n_segments - 1:
-                real_end = arr_plot.shape[1]
-                arr_plot = np.hstack(
-                    (
-                        arr_plot,
-                        np.zeros(
-                            (self.groups_num, segment_size - (size % segment_size))
-                        ),
-                    )
-                )
-                arr_prob = np.hstack(
-                    (arr_prob, -np.ones(segment_size - (size % segment_size)))
-                )
-                size = arr_plot.shape[1]
+        title, y_label, columns_labels = self.grouping_strategy.get_plot_texts()
 
-            init = n * segment_size
-            end = min((n + 1) * segment_size, size)
+        for segment_idx in range(n_segments):
+            real_end = min((segment_idx + 1) * segment_size, size)
+
+            if segment_idx == n_segments - 1 and size % segment_size != 0:
+                pad_size = segment_size - (size % segment_size)
+                arr_plot = np.hstack((arr_plot, np.zeros((self.groups_num, pad_size))))
+                arr_prob = np.hstack((arr_prob, -np.ones(pad_size)))
+
+            init = segment_idx * segment_size
+            end = min((segment_idx + 1) * segment_size, arr_plot.shape[1])
             segment = arr_plot[:, init:end]
-            ax = axs[n]
 
+            ax = axs[segment_idx]
             ax.set_xlabel("Window", fontsize=fontsize)
+            ax.set_ylabel(y_label, fontsize=fontsize)
+            ax.set_title(title, fontsize=fontsize)
 
             cax = ax.imshow(
                 segment,
@@ -233,13 +248,11 @@ class ShaTS(ABC):
                     ax.get_position().height + 0.125,
                 )
             )
-
             cbar = fig.colorbar(cax, cax=cbar_ax, orientation="vertical")
             cbar.ax.tick_params(labelsize=fontsize)
 
             ax2 = ax.twinx()
-
-            prediction = arr_prob[init:real_end]  # Ajustar a realEnd
+            prediction = arr_prob[init:real_end]
             ax2.plot(
                 np.arange(0, real_end - init),
                 prediction,
@@ -247,11 +260,9 @@ class ShaTS(ABC):
                 color="darkviolet",
                 linewidth=4,
             )
-
             ax2.axhline(0.5, color="black", linewidth=1, linestyle="--")
             ax2.set_ylim(0, 1)
             ax2.tick_params(axis="y", labelsize=fontsize)
-
             ax2.set_ylabel("Model outcome", fontsize=fontsize)
 
             legend = ax2.legend(
@@ -264,267 +275,254 @@ class ShaTS(ABC):
             legend.get_frame().set_facecolor((0, 0, 0, 0))
             legend.get_frame().set_edgecolor("black")
 
-            title, y_label, columns_labels = self.grouping_strategy.get_plot_texts()
-
-            ax.set_ylabel(y_label, fontsize=fontsize)
-            ax.set_title(title, fontsize=fontsize)
-
             ax.set_yticks(np.arange(self.groups_num))
             ax.set_yticklabels(columns_labels, fontsize=fontsize)
 
             xticks = np.arange(0, segment.shape[1], 5)
             xlabels = np.arange(init, real_end, 5)
-
             xticks = xticks[: len(xlabels)]
 
             ax.set_xticks(xticks)
             ax.set_xticklabels(xlabels, fontsize=fontsize)
 
-        #plt.tight_layout()
-
         if path is not None:
             plt.savefig(path)
         plt.show()
 
+    def _resolve_grouping_strategy(
+        self,
+        grouping_strategy: str | AbstractGroupingStrategy,
+        custom_groups: list[list[int]] | None,
+    ) -> AbstractGroupingStrategy:
+        """
+        Build the grouping strategy used by the explainer.
+        """
+        if isinstance(grouping_strategy, AbstractGroupingStrategy):
+            return grouping_strategy
 
+        if grouping_strategy == "time":
+            return TimeGroupingStrategy(groups_num=self.window_size)
+        if grouping_strategy == "feature":
+            return FeaturesGroupingStrategy(groups_num=self.num_of_features)
+        if grouping_strategy == "multifeature":
+            if custom_groups is None:
+                raise ValueError(
+                    "custom_groups must be provided when grouping_strategy is 'multifeature'."
+                )
+            return MultifeaturesGroupingStrategy(
+                groups_num=len(custom_groups),
+                custom_groups=custom_groups,
+            )
+
+        raise ValueError(
+            "grouping_strategy must be 'time', 'feature', 'multifeature', "
+            "or an AbstractGroupingStrategy instance."
+        )
+
+    def _call_model(self, data: Tensor) -> Tensor:
+        """
+        Call the wrapped model and return a tensor of shape [batch, nclass].
+        """
+        data = data.to(self.device)
+        if data.dim() == 2:
+            data = data.unsqueeze(0)
+
+        output = self.model_wrapper(data)
+        if output.dim() == 1:
+            output = output.unsqueeze(0)
+        if output.dim() != 2:
+            raise ValueError("model_wrapper must return a tensor of shape [batch, nclass].")
+        return output
 
     def _generate_coefficients_dict(self) -> dict[int, float]:
         """
-        Generates a dictionary of coefficients for each group size.
-        The coefficients are calculated based on the number of groups and the
-        subsets generation strategy.
+        Generate Shapley coefficients for each coalition size.
         """
-        coef_dict = dict[int, float]()
-        if self.subsets_generation_strategy.value == StrategySubsets.EXACT.value:
-            for i in range(self.groups_num):
-                coef_dict[i] = (
-                    math.factorial(i)
-                    * math.factorial(self.groups_num - i - 1)
+        coef_dict: dict[int, float] = {}
+        if self.subsets_generation_strategy == StrategySubsets.EXACT:
+            for coalition_size in range(self.groups_num):
+                coef_dict[coalition_size] = (
+                    math.factorial(coalition_size)
+                    * math.factorial(self.groups_num - coalition_size - 1)
                     / math.factorial(self.groups_num)
                 )
         else:
-            for i in range(self.groups_num):
-                coef_dict[i] = 1 / self.groups_num
+            for coalition_size in range(self.groups_num):
+                coef_dict[coalition_size] = 1 / self.groups_num
         return coef_dict
 
     def _compute_mean_prediction(self) -> Tensor:
         """
-        Computes the mean prediction of the model on the support dataset.
+        Compute the mean model prediction over the background dataset.
         """
         mean_prediction = torch.zeros(self.nclass, device=self.device)
 
         with torch.no_grad():
-            for data in self.support_dataset:
-                probs = self.model_wrapper(data)
-                for class_idx in range(self.nclass):
-                    mean_prediction[class_idx] += probs[0, class_idx].cpu()
+            for data in self.background_dataset:
+                probs = self._call_model(data)[0]
+                mean_prediction += probs
 
-        return mean_prediction / len(self.support_dataset)
-
+        return mean_prediction / len(self.background_dataset)
 
     def _modify_data_batches(self, data: Tensor) -> list[Tensor]:
         """
-        Modifies the data batches based on the grouping strategy.
+        Build the modified batches required by ShaTS for one instance.
         """
-        modified_data_batches = list[Tensor]()
+        modified_data_batches: list[Tensor] = []
 
         for subset in self.all_subsets:
             data_tensor = (
-                data
-                .unsqueeze(0)
-                .expand(len(self.support_dataset), *data.shape)
+                data.unsqueeze(0)
+                .expand(len(self.background_dataset), *data.shape)
                 .clone()
                 .to(self.device)
             )
             modified_data_batches.append(
                 self.grouping_strategy.modify_tensor(
-                    subset, self.device, self.support_tensor, data_tensor
+                    subset=subset,
+                    device=self.device,
+                    background_tensor=self.background_tensor,
+                    tensor=data_tensor,
                 )
             )
 
         return modified_data_batches
 
-    def _compute_probs(
-        self,
-        modified_data_batches: list[Tensor]
-    ) -> list[Tensor]:
+    def _compute_probs(self, modified_data_batches: Sequence[Tensor]) -> list[Tensor]:
         """
-        Computes the probabilities of the model based on the modified data batches.
+        Compute model probabilities for all modified batches.
         """
-        probs: list[list[Tensor]] = []
-        probs = [[] for _ in range(self.nclass)]
+        probs: list[list[Tensor]] = [[] for _ in range(self.nclass)]
 
-        for i in range(0, len(modified_data_batches), self.batch_size):
-            batch = torch.cat(modified_data_batches[i : i + self.batch_size]).to(self.device)
-            batch_probs = self.model_wrapper(batch)
+        for batch_start in range(0, len(modified_data_batches), self.batch_size):
+            batch = torch.cat(
+                modified_data_batches[batch_start : batch_start + self.batch_size],
+                dim=0,
+            ).to(self.device)
+            batch_probs = self._call_model(batch)
 
             for class_idx in range(self.nclass):
-                class_probs = batch_probs[:, class_idx].cpu()
-                probs[class_idx].append(class_probs)
+                probs[class_idx].append(batch_probs[:, class_idx])
 
-        probs = [torch.cat(class_probs, dim=0).to(self.device) for class_probs in probs]
-
-        return probs
+        return [torch.cat(class_probs, dim=0) for class_probs in probs]
 
     def _compute_differences(
-        self, probs: Tensor, instant: int, size: int
+        self,
+        probs: Sequence[Tensor],
+        group: int,
+        size: int,
     ) -> tuple[Tensor, Tensor]:
         """
-        Computes the differences between the probabilities of the model for the
-        subsets with and without the current group.
+        Compute the model output differences for the subsets with and without one group.
         """
-        subsets_with, subsets_without = self.subsets_dict[(instant, size)]
+        subsets_with, subsets_without = self.subsets_dict[(group, size)]
         prob_with = torch.zeros(self.nclass, len(subsets_with), device=self.device)
         prob_without = torch.zeros(self.nclass, len(subsets_without), device=self.device)
 
-        for i, (item_with, item_without) in enumerate(
+        for pair_index, (item_with, item_without) in enumerate(
             zip(subsets_with, subsets_without)
         ):
             indexes_with = [
                 self.pair_dicts[(tuple(item_with), entity)]
-                for entity in range(len(self.support_dataset))
+                for entity in range(len(self.background_dataset))
             ]
             indexes_without = [
                 self.pair_dicts[(tuple(item_without), entity)]
-                for entity in range(len(self.support_dataset))
+                for entity in range(len(self.background_dataset))
             ]
-            indexes_with_tensor = torch.tensor(indexes_with,
-                                               dtype=torch.long, device=self.device)
-            indexes_without_tensor = torch.tensor(indexes_without,
-                                                  dtype=torch.long, device=self.device)
+
+            indexes_with_tensor = torch.tensor(indexes_with, dtype=torch.long, device=self.device)
+            indexes_without_tensor = torch.tensor(
+                indexes_without, dtype=torch.long, device=self.device
+            )
             coef = self.coefficients_dict[len(item_without)]
+
             mean_probs_with = torch.zeros(self.nclass, device=self.device)
             mean_probs_without = torch.zeros(self.nclass, device=self.device)
 
             for class_idx in range(self.nclass):
-                selected_probs_with = torch.index_select(probs[class_idx],
-                                                         0, indexes_with_tensor)
-                selected_probs_without = torch.index_select(probs[class_idx],
-                                                            0, indexes_without_tensor)
+                selected_probs_with = torch.index_select(
+                    probs[class_idx], 0, indexes_with_tensor
+                )
+                selected_probs_without = torch.index_select(
+                    probs[class_idx], 0, indexes_without_tensor
+                )
 
                 mean_probs_with[class_idx] = selected_probs_with.mean() * coef
                 mean_probs_without[class_idx] = selected_probs_without.mean() * coef
 
-            prob_with[:, i] = mean_probs_with
-            prob_without[:, i] = mean_probs_without
-
+            prob_with[:, pair_index] = mean_probs_with
+            prob_without[:, pair_index] = mean_probs_without
 
         return prob_with, prob_without
 
 
+
 class ApproShaTS(ShaTS):
     """
-    Original implementation of the ShaTS algorithm. 
-    This implementation is optimized for resource efficiency.
+    Original ShaTS implementation optimized for lower memory usage.
     """
-    def __init__(
-        self,
-        model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
-        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
-        m: int = 5,
-        batch_size: int = 32,
-        device: str | torch.device | int = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        ),
-        custom_groups: list[list[int]] | None = None,
-    ):
-        super().__init__(
-            support_dataset=support_dataset,
-            grouping_strategy=grouping_strategy,
-            subsets_generation_strategy=subsets_generation_strategy,
-            m=m,
-            batch_size=batch_size,
-            device=device,
-            custom_groups=custom_groups,
-            model_wrapper=model_wrapper
+
+    def compute(self, test_dataset: Sequence[Tensor]) -> Tensor:
+        """
+        Compute ShaTS values with the original algorithm.
+        """
+        validate_window_dataset(test_dataset, "test_dataset")
+        shats_values_list = torch.zeros(
+            len(test_dataset),
+            self.groups_num,
+            self.nclass,
+            device=self.device,
         )
 
-    def compute(
-        self,
-        test_dataset: list[Tensor]
-    ) -> Tensor:
-        shats_values_list = torch.zeros(
-        len(test_dataset),
-        self.groups_num,
-        self.nclass,
-        device=self.device
-        )
         total = len(test_dataset)
         with torch.no_grad():
             for idx, data in enumerate(test_dataset):
                 progress = (idx + 1) / total * 100
                 print(f"\rProcessing item {idx + 1}/{total} ({progress:.2f}%)", end="")
 
-                tsgshapvalues = torch.zeros(self.groups_num, self.nclass, device=self.device)
+                shats_values = torch.zeros(
+                    self.groups_num,
+                    self.nclass,
+                    device=self.device,
+                )
 
-                modified_data_batches = self._modify_data_batches(data)
+                modified_data_batches = self._modify_data_batches(data.to(self.device))
                 probs = self._compute_probs(modified_data_batches)
 
                 for group in range(self.groups_num):
                     for size in range(self.groups_num):
                         prob_with, prob_without = self._compute_differences(
-                            probs, group, size
+                            probs=probs,
+                            group=group,
+                            size=size,
                         )
+                        diff = prob_with - prob_without
+                        shats_values[group] += diff.mean(dim=1)
 
-                        resta = prob_with - prob_without
+                shats_values_list[idx] = shats_values
 
-                        for class_idx in range(self.nclass):
-                            tsgshapvalues[group, class_idx] += resta[class_idx].mean()
-
-                shats_values_list[idx] = tsgshapvalues.clone()
-
-                del (
-                    modified_data_batches,
-                    probs,
-                    tsgshapvalues,
-                )
-                torch.cuda.empty_cache()
+                del modified_data_batches, probs, shats_values
+                _clear_cuda_cache()
 
         return shats_values_list
 
 
-
-
 class FastShaTS(ShaTS):
     """
-    Fast implementation of the ShaTS algorithm. 
-    This implementation is based on the original ShaTS algorithm but optimized for speed.
+    Faster ShaTS implementation based on a precomputed subset reverse index.
     """
-    def __init__(
-        self,
-        model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
-        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
-        m: int = 5,
-        batch_size: int = 32,
-        device: str | torch.device | int = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        ),
-        custom_groups: list[list[int]] | None = None,
-    ):
-        super().__init__(
-            support_dataset=support_dataset,
-            grouping_strategy=grouping_strategy,
-            subsets_generation_strategy=subsets_generation_strategy,
-            m=m,
-            batch_size=batch_size,
-            device=device,
-            custom_groups=custom_groups,
-            model_wrapper=model_wrapper
-        )
 
-    def compute(
-        self,
-        test_dataset: list[Tensor]
-    ) -> Tensor:
-        tsgshapvalues_list = torch.zeros(
-        len(test_dataset),
-        self.groups_num,
-        self.nclass,
-        device=self.device
+    def compute(self, test_dataset: Sequence[Tensor]) -> Tensor:
+        """
+        Compute ShaTS values with the fast algorithm.
+        """
+        validate_window_dataset(test_dataset, "test_dataset")
+        shats_values_list = torch.zeros(
+            len(test_dataset),
+            self.groups_num,
+            self.nclass,
+            device=self.device,
         )
         reversed_dict = self._reverse_dict(self.subsets_dict, self.all_subsets)
 
@@ -534,541 +532,188 @@ class FastShaTS(ShaTS):
                 progress = (idx + 1) / total * 100
                 print(f"\rProcessing item {idx + 1}/{total} ({progress:.2f}%)", end="")
 
-                tsgshapvalues = torch.zeros(self.groups_num, self.nclass, device=self.device)
+                shats_values = torch.zeros(
+                    self.groups_num,
+                    self.nclass,
+                    device=self.device,
+                )
 
-                modified_data_batches = self._modify_data_batches(data)
-
+                modified_data_batches = self._modify_data_batches(data.to(self.device))
                 probs = self._compute_probs(modified_data_batches)
 
                 for class_idx in range(self.nclass):
+                    for subset_index, references in enumerate(reversed_dict.values()):
+                        start = subset_index * len(self.background_dataset)
+                        end = (subset_index + 1) * len(self.background_dataset)
+                        contribution = probs[class_idx][start:end].mean() / self.groups_num
 
-                    for i, value in enumerate(reversed_dict.values()):
-                        add = probs[class_idx][
-                            i
-                            * len(self.support_dataset) : (i + 1)
-                            * len(self.support_dataset)
-                        ].mean()
+                        for reference in references:
+                            group_key, sign_flag = reference
+                            normalizer = len(self.subsets_dict[(group_key[0], group_key[1])][0])
 
-                        add = add / self.groups_num
-                        for v in value:
-
-                            if v[1] == 0:
-                                tsgshapvalues[v[0][0]][class_idx] -= add / len(
-                                    self.subsets_dict[(v[0][0], v[0][1])][0]
-                                )
-
+                            if sign_flag == 0:
+                                shats_values[group_key[0], class_idx] -= contribution / normalizer
                             else:
-                                tsgshapvalues[v[0][0]][class_idx] += add / len(
-                                    self.subsets_dict[(v[0][0], v[0][1])][0]
-                                )
-                    tsgshapvalues_list[idx] = -tsgshapvalues.clone()
+                                shats_values[group_key[0], class_idx] += contribution / normalizer
 
-                del (
-                    modified_data_batches,
-                    probs,
-                    tsgshapvalues,
-                )
+                shats_values_list[idx] = shats_values
 
-        return tsgshapvalues_list
+                del modified_data_batches, probs, shats_values
+                _clear_cuda_cache()
+
+        return shats_values_list
 
     def _reverse_dict(
         self,
         subsets_dict: dict[Any, Any],
-        subsets_total: list[Any]
-    ) -> dict[tuple[Any], list[Any]]:
-        subsets_dict_reversed = dict[tuple[Any], list[Any]]()
-        for subset in subsets_total:
-            subsets_dict_reversed[tuple(subset)] = []
+        subsets_total: Sequence[Any],
+    ) -> dict[tuple[Any, ...], list[Any]]:
+        """
+        Build the reverse mapping from subset to group references.
+        """
+        subsets_dict_reversed: dict[tuple[Any, ...], list[Any]] = {
+            tuple(subset): [] for subset in subsets_total
+        }
 
         for subset in subsets_total:
-            for clave, valor in subsets_dict.items():
-                if list(subset) in valor[0]:
-                    subsets_dict_reversed[tuple(subset)].append((clave, 0))
-
-                if list(subset) in valor[1]:
-                    subsets_dict_reversed[tuple(subset)].append((clave, 1))
+            for key, value in subsets_dict.items():
+                if list(subset) in value[0]:
+                    subsets_dict_reversed[tuple(subset)].append((key, 0))
+                if list(subset) in value[1]:
+                    subsets_dict_reversed[tuple(subset)].append((key, 1))
 
         return subsets_dict_reversed
 
+
 class KernelShaTS(ShaTS):
     """
-    Kernel-based implementation of the ShaTS algorithm.
-    This implementation uses a kernel regression model to compute the Shapley values."""
-    def __init__(
-        self,
-        model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
-        subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
-        m: int = 5,
-        batch_size: int = 32,
-        device: str | torch.device | int = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        ),
-        custom_groups: list[list[int]] | None = None,
-    ):
-        super().__init__(
-            support_dataset=support_dataset,
-            grouping_strategy=grouping_strategy,
-            subsets_generation_strategy=subsets_generation_strategy,
-            m=m,
-            batch_size=batch_size,
-            device=device,
-            custom_groups=custom_groups,
-            model_wrapper=model_wrapper
-        )
+    Kernel-based ShaTS implementation.
+    """
 
-        self.keys_support_subsets = [
-            (tuple(subset), entity)
-            for subset in self.all_subsets
-            for entity in range(len(self.support_dataset))
-        ]
-        self.pair_dicts = {
-            (subset, entity): i
-            for i, (subset, entity) in enumerate(self.keys_support_subsets)
-        }
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
 
         self.binary_vectors = self._subsets_to_binary_vectors()
-        self.weights = self._compute_weigths()
- 
- 
+        self.weights = self._compute_weights()
+
     def compute(
         self,
-        test_dataset: list[Tensor],
+        test_dataset: Sequence[Tensor],
         learning_rate: float = 0.01,
         early_stopping_rate: float = 0.1,
         num_epochs: int = 10,
     ) -> Tensor:
-        tsgshapvalues_list = torch.zeros(
-        len(test_dataset),
-        self.groups_num,
-        self.nclass,
-        device=self.device,
-    )
- 
-        def weighted_loss(y_true, y_pred, weights):
-            return torch.sum(weights * (y_true - y_pred) ** 2)
-        
- 
-        class WeightedLinearRegression(nn.Module):
-            """
-            Modelo de regresión lineal ponderada."""
-            def __init__(self, input_dim):
-                super(WeightedLinearRegression, self).__init__()
-                self.linear = nn.Linear(input_dim, 1)
-        
-            def forward(self, x):
-                return self.linear(x)
-        
- 
-        tsgshapvalues_list = torch.zeros(len(test_dataset), self.groups_num, device=self.device)
-        regression_model = WeightedLinearRegression(input_dim=self.binary_vectors.shape[1]).to(self.device)
-        optimizer = optim.Adam(regression_model.parameters(), learning_rate)
- 
-        weights_tensor = torch.tensor(self.weights, dtype=torch.float32, device=self.device, requires_grad=False)
- 
-        last_loss = 0.01
+        """
+        Compute ShaTS values with a weighted linear regression approximation.
+        """
+        validate_window_dataset(test_dataset, "test_dataset")
+        shats_values_list = torch.zeros(
+            len(test_dataset),
+            self.groups_num,
+            self.nclass,
+            device=self.device,
+        )
+
+        binary_vectors_tensor = torch.tensor(
+            self.binary_vectors,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        weights_tensor = torch.tensor(
+            self.weights,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(1)
+
         for idx, data in enumerate(test_dataset):
             with torch.no_grad():
-                modified_data_batches = self._modify_data_batches(data)
+                modified_data_batches = self._modify_data_batches(data.to(self.device))
                 probs = self._compute_probs(modified_data_batches)
- 
-            prediccion = torch.zeros(len(self.all_subsets), device=self.device)
-            for i, subset in enumerate(self.all_subsets):
-                indexes = [self.pair_dicts[(tuple(subset), entity)] for entity in range(len(self.support_dataset))]
-                prediccion[i] = probs[0][indexes].mean()
- 
-            target = prediccion.unsqueeze(1).to(self.device)
- 
- 
-            for _ in range(num_epochs):
-                optimizer.zero_grad()
-                pred = regression_model(torch.tensor(self.binary_vectors, dtype=torch.float32).to(self.device))
- 
-                loss = weighted_loss(pred, target, weights_tensor)
- 
-                loss.backward()
-                upgrade = abs(last_loss - loss.item()) / last_loss
-                if upgrade < early_stopping_rate:
-                    break
-                last_loss = loss.item()
-                optimizer.step()
- 
-            raw_weights = regression_model.linear.weight.detach().cpu().numpy().flatten()        
- 
-            tsgshapvalues = raw_weights
-            tsgshapvalues_list[idx] = torch.tensor(tsgshapvalues, device=self.device)
- 
+
+            for class_idx in range(self.nclass):
+                target = torch.zeros(len(self.all_subsets), 1, device=self.device)
+                for subset_index, subset in enumerate(self.all_subsets):
+                    indexes = [
+                        self.pair_dicts[(tuple(subset), entity)]
+                        for entity in range(len(self.background_dataset))
+                    ]
+                    target[subset_index, 0] = probs[class_idx][indexes].mean()
+
+                regression_model = _WeightedLinearRegression(
+                    input_dim=binary_vectors_tensor.shape[1]
+                ).to(self.device)
+                optimizer = optim.Adam(regression_model.parameters(), lr=learning_rate)
+
+                last_loss: float | None = None
+                for _ in range(num_epochs):
+                    optimizer.zero_grad()
+                    prediction = regression_model(binary_vectors_tensor)
+                    loss = torch.sum(weights_tensor * (target - prediction) ** 2)
+                    loss.backward()
+
+                    current_loss = float(loss.item())
+                    if last_loss is not None:
+                        improvement = abs(last_loss - current_loss) / max(abs(last_loss), 1e-12)
+                        if improvement < early_stopping_rate:
+                            break
+                    last_loss = current_loss
+                    optimizer.step()
+
+                raw_weights = regression_model.linear.weight.detach().flatten()
+                shats_values_list[idx, :, class_idx] = raw_weights
+
             del modified_data_batches, probs
-            torch.cuda.empty_cache()
- 
-        return (tsgshapvalues_list)
- 
-    def _subsets_to_binary_vectors(self):
-        
-        binary_vectors = np.zeros((len(self.all_subsets), self.groups_num), dtype=int)
- 
-        for i, subset in enumerate(self.all_subsets):
-            binary_vectors[i, subset] = 1
- 
-        return binary_vectors
-    
-    def _compute_weigths(self):
-        weights = []
-        M = self.groups_num
-        
-        for coalition in self.binary_vectors:
-            z_prime_size = sum(coalition)
-            
-            if z_prime_size == 0 or z_prime_size == M:
-                weights.append(0)
-            else:
-                weight = (M - 1) / (math.comb(M, z_prime_size) * z_prime_size * (M - z_prime_size))
-                weights.append(weight)
-        
-        return weights
-
-class CachedKernelShaTS:
-    """
-    Meta-explainer que envuelve a KernelShaTS y reutiliza explicaciones
-    cuando las ventanas son muy parecidas (globalmente o por grupo).
-
-    API:
-        compute(test_dataset, learning_rate, early_stopping_rate, num_epochs)
-        -> Tensor de shape [N, groups_num, nclass]
-    """
-
-    def __init__(
-        self,
-        model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
-        m: int = 5,
-        batch_size: int = 32,
-        device: str | torch.device | int = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        ),
-        custom_groups: list[list[int]] | None = None,
-        # Parámetros nuevos para aprovechar repetición
-        global_similarity_threshold: float = 0.01,
-        group_change_threshold: float = 0.01,
-        max_cache_size: int = 1000,
-        hash_decimals: int = 3,
-    ) -> None:
-        # Explainer base: el que realmente calcula los Shapley cuando hace falta
-        self.base_explainer = KernelShaTS(
-            model_wrapper=model_wrapper,
-            support_dataset=support_dataset,
-            grouping_strategy=grouping_strategy,
-            subsets_generation_strategy=StrategySubsets.APPROX,
-            m=m,
-            batch_size=batch_size,
-            device=device,
-            custom_groups=custom_groups,
-        )
-
-        self.device = device
-        self.groups_num = self.base_explainer.groups_num
-        self.nclass = self.base_explainer.nclass
-        self.grouping_strategy = self.base_explainer.grouping_strategy
-        self.global_similarity_threshold = global_similarity_threshold
-        self.group_change_threshold = group_change_threshold
-        self.max_cache_size = max_cache_size
-        self.hash_decimals = hash_decimals
-
-        # Caché: hash(data) -> shap_values [groups_num, nclass]
-        self._cache: dict[int, Tensor] = {}
-        self._cache_keys: list[int] = []  
-
-    # ---------- Utilidades internas ----------
-
-    def _hash_tensor(self, data: Tensor) -> int:
-        """
-        Hash simple del tensor, redondeando a ciertos decimales para agrupar
-        ventanas muy parecidas.
-        """
-        arr = data.detach().cpu().numpy()
-        arr = np.round(arr, decimals=self.hash_decimals)
-        return hash(arr.tobytes())
-
-    def _global_change(self, x_new: Tensor, x_old: Tensor) -> float:
-        """
-        Cambio relativo global entre dos ventanas.
-        """
-        diff = (x_new - x_old).detach().cpu().numpy()
-        old = x_old.detach().cpu().numpy()
-        num = np.linalg.norm(diff)
-        den = np.linalg.norm(old) + 1e-8
-        return float(num / den)
-
-    def _per_group_change(self, x_new: Tensor, x_old: Tensor) -> np.ndarray:
-        """
-        Cambio medio por grupo, según la estrategia de agrupamiento.
-        Devuelve un array de shape [groups_num].
-        """
-        x_new_np = x_new.detach().cpu().numpy()
-        x_old_np = x_old.detach().cpu().numpy()
-        changes = np.zeros(self.groups_num, dtype=float)
-
-        from .grouping import TimeGroupingStrategy, FeaturesGroupingStrategy, MultifeaturesGroupingStrategy
-
-        # Caso 1: agrupación temporal (cada grupo = un instante)
-        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
-            # groups_num == window_size
-            for g in range(self.groups_num):
-                diff = x_new_np[g, :] - x_old_np[g, :]
-                base = x_old_np[g, :]
-                num = np.linalg.norm(diff)
-                den = np.linalg.norm(base) + 1e-8
-                changes[g] = num / den
-
-        # Caso 2: agrupación por feature (cada grupo = una feature)
-        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
-            # groups_num == num_features
-            for g in range(self.groups_num):
-                diff = x_new_np[:, g] - x_old_np[:, g]
-                base = x_old_np[:, g]
-                num = np.linalg.norm(diff)
-                den = np.linalg.norm(base) + 1e-8
-                changes[g] = num / den
-
-        # Caso 3: multifeature (cada grupo = conjunto de features)
-        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
-            custom_groups = self.grouping_strategy._custom_groups  # ya está en tu clase
-            for g, feat_idxs in enumerate(custom_groups):
-                diff = x_new_np[:, feat_idxs] - x_old_np[:, feat_idxs]
-                base = x_old_np[:, feat_idxs]
-                num = np.linalg.norm(diff)
-                den = np.linalg.norm(base) + 1e-8
-                changes[g] = num / den
-
-        else:
-            # Fallback simple: mismo cambio global para todos los grupos
-            glob = self._global_change(x_new, x_old)
-            changes[:] = glob
-
-        return changes
-
-    def _get_from_cache(self, key: int) -> Tensor | None:
-        return self._cache.get(key, None)
-
-    def _store_in_cache(self, key: int, shap: Tensor) -> None:
-        if key in self._cache:
-            return
-        if len(self._cache_keys) >= self.max_cache_size:
-            # Política FIFO: borramos el más antiguo
-            old_key = self._cache_keys.pop(0)
-            self._cache.pop(old_key, None)
-        self._cache[key] = shap.detach().clone()
-        self._cache_keys.append(key)
-
-    # ---------- Método principal ----------
-
-    def compute(
-        self,
-        test_dataset: list[Tensor],
-        learning_rate: float = 0.01,
-        early_stopping_rate: float = 0.1,
-        num_epochs: int = 10,
-    ) -> Tensor:
-        """
-        Calcula ShaTS con KernelShaTS, pero reutilizando explicaciones
-        cuando las ventanas son muy parecidas.
-
-        Devuelve: Tensor [N, groups_num, nclass]
-        """
-        N = len(test_dataset)
-        shats_values_list = torch.zeros(
-            N, self.groups_num, self.nclass, device=self.device
-        )
-
-        prev_x: Tensor | None = None
-        prev_shap: Tensor | None = None
-
-        for idx, data in enumerate(test_dataset):
-            data = data.to(self.device)
-            key = self._hash_tensor(data)
-
-            # 1) Intento caché
-            shap = self._get_from_cache(key)
-            if shap is not None:
-                shats_values_list[idx] = shap
-                prev_x, prev_shap = data, shap
-                continue
-
-            # 2) Si tengo ventana anterior, compruebo similitud global
-            if prev_x is not None and prev_shap is not None:
-                g_change = self._global_change(data, prev_x)
-                if g_change < self.global_similarity_threshold:
-                    # Ventana muy parecida: reutilizo explicación entera
-                    shats_values_list[idx] = prev_shap
-                    self._store_in_cache(key, prev_shap)
-                    prev_x, prev_shap = data, prev_shap
-                    continue
-
-            # 3) Calculo explicación base con KernelShaTS
-            base_result = self.base_explainer.compute(
-                [data],
-                learning_rate=learning_rate,
-                early_stopping_rate=early_stopping_rate,
-                num_epochs=num_epochs,
-            )
-            # base_result shape actual de KernelShaTS: [1, groups_num] (solo clase 0)
-            base_shap = base_result[0]  # [groups_num] o [groups_num, nclass?]
-
-            # Aseguramos shape [groups_num, nclass]
-            if base_shap.dim() == 1:
-                # Solo explica la clase 0: la ponemos en [:,0] y el resto a 0
-                tmp = torch.zeros(self.groups_num, self.nclass, device=self.device)
-                tmp[:, 0] = base_shap
-                base_shap = tmp
-            elif base_shap.dim() == 2 and base_shap.shape[1] != self.nclass:
-                # Por si en un futuro cambias KernelShaTS: nos adaptamos
-                # Reescalamos a nclass con padding de ceros si hace falta
-                tmp = torch.zeros(self.groups_num, self.nclass, device=self.device)
-                cols = min(self.nclass, base_shap.shape[1])
-                tmp[:, :cols] = base_shap[:, :cols]
-                base_shap = tmp
-
-            # 4) Refinamiento por grupo: copiar grupos casi iguales de la ventana anterior
-            if prev_x is not None and prev_shap is not None:
-                per_group_change = self._per_group_change(data, prev_x)  # [groups_num]
-                base_np = base_shap.detach().cpu().numpy()
-                prev_np = prev_shap.detach().cpu().numpy()
-
-                mask_copy = per_group_change < self.group_change_threshold
-                base_np[mask_copy, :] = prev_np[mask_copy, :]
-
-                base_shap = torch.tensor(
-                    base_np, device=self.device, dtype=base_shap.dtype
-                )
-
-            shats_values_list[idx] = base_shap
-            self._store_in_cache(key, base_shap)
-            prev_x, prev_shap = data, base_shap
+            _clear_cuda_cache()
 
         return shats_values_list
 
+    def _subsets_to_binary_vectors(self) -> np.ndarray:
+        """
+        Convert subsets into binary indicator vectors.
+        """
+        binary_vectors = np.zeros((len(self.all_subsets), self.groups_num), dtype=int)
+        for index, subset in enumerate(self.all_subsets):
+            binary_vectors[index, list(subset)] = 1
+        return binary_vectors
 
+    def _compute_weights(self) -> list[float]:
+        """
+        Compute kernel weights for the binary subset vectors.
+        """
+        weights: list[float] = []
+        total_groups = self.groups_num
+
+        for coalition in self.binary_vectors:
+            coalition_size = int(np.sum(coalition))
+            if coalition_size == 0 or coalition_size == total_groups:
+                weights.append(0.0)
+            else:
+                weight = (total_groups - 1) / (
+                    math.comb(total_groups, coalition_size)
+                    * coalition_size
+                    * (total_groups - coalition_size)
+                )
+                weights.append(float(weight))
+
+        return weights
 
 ##IG Explainer
 
-def _build_group_directions(
-    x: Tensor,
-    baseline: Tensor,
-    grouping_strategy: AbstractGroupingStrategy,
-) -> Tensor:
-    """
-    Construye d_stack[g] = (x - baseline) restringido al grupo g.
-
-    x: [T, F]
-    baseline: [T, F]
-    return: [G, T, F]
-    """
-    diff = x - baseline  # [T, F]
-    T, F = diff.shape
-    G = grouping_strategy.groups_num
-
-    d_stack = torch.zeros(G, T, F, device=x.device, dtype=x.dtype)
-
-    if isinstance(grouping_strategy, TimeGroupingStrategy):
-        # grupo g = instante g, todas las features
-        for g in range(G):
-            d_stack[g, g, :] = diff[g, :]
-
-    elif isinstance(grouping_strategy, FeaturesGroupingStrategy):
-        # grupo g = feature g, todos los tiempos
-        for g in range(G):
-            d_stack[g, :, g] = diff[:, g]
-
-    elif isinstance(grouping_strategy, MultifeaturesGroupingStrategy):
-        custom_groups = grouping_strategy._custom_groups
-        for g, feat_idxs in enumerate(custom_groups):
-            d_stack[g, :, feat_idxs] = diff[:, feat_idxs]
-
-    else:
-        # Fallback: todo el diff en cada grupo
-        for g in range(G):
-            d_stack[g] = diff
-
-    return d_stack  # [G, T, F]
-
-
-def integrated_gradients_groups_direct(
-    model_wrapper: Callable[[Tensor], Tensor],
-    x: Tensor,                          # [T, F]
-    baseline: Tensor,                   # [T, F]
-    grouping_strategy: AbstractGroupingStrategy,
-    class_idx: int = 0,
-    steps: int = 50,
-    device: torch.device | str = "cpu",
-) -> Tensor:
-    """
-    Integrated Gradients directamente a nivel de grupo.
-
-    Devuelve: Tensor [groups_num] con la atribución de cada grupo
-    para la clase class_idx.
-    """
-    device = torch.device(device)
-    x = x.to(device)
-    baseline = baseline.to(device)
-
-    # 1) Direcciones por grupo
-    d_stack = _build_group_directions(x, baseline, grouping_strategy)  # [G, T, F]
-    G, T, F = d_stack.shape
-
-    # 2) Acumulador de gradientes respecto a alpha (uno por grupo)
-    grad_alpha_sum = torch.zeros(G, device=device)
-
-    # 3) Integramos alpha de 0 a 1 (todos los grupos escalan a la vez)
-    alphas = torch.linspace(0.0, 1.0, steps, device=device)
-
-    for alpha_scalar in alphas:
-        # alpha: [G], mismo escalar para todos los grupos
-        alpha = torch.full((G,), alpha_scalar, device=device, requires_grad=True)
-
-        x_alpha = baseline + torch.tensordot(alpha, d_stack, dims=1)  # [T, F]
-        x_alpha_batch = x_alpha.unsqueeze(0)  # [1, T, F] para el modelo
-
-        out = model_wrapper(x_alpha_batch)  # [1, nclass]
-        target = out[0, class_idx]
-
-        if alpha.grad is not None:
-            alpha.grad.zero_()
-        target.backward()
-        grad_alpha_sum += alpha.grad.detach()
-
-    # IG por grupo = media de grad_alpha (delta_alpha = 1)
-    ig_groups = grad_alpha_sum / steps  # [G]
-
-    return ig_groups
-
-
-
 class FastShaTSIG(FastShaTS):
     """
-    Variante de FastShaTS que explota la continuidad temporal:
-
-    - En el primer instante (y cada `force_full_every` pasos) calcula
-      FastShaTS completo.
-    - Entre medias, si la distancia entre x_t y x_{t-1} es pequeña,
-      actualiza las explicaciones como:
-
-          phi_t ≈ phi_{t-1} + IG(x_{t-1} -> x_t) * ig_lambda
-
-      (IG agrupado por grupos ShaTS).
-
-    - Si la distancia entre x_t y x_{t-1} es grande, fuerza un
-      recálculo completo de FastShaTS.
-
+    FastShaTS variant that updates explanations with group-level Integrated Gradients between close windows.
     """
 
     def __init__(
         self,
         model_wrapper: Callable[[Tensor], Tensor],
         grad_model_wrapper: Callable[[Tensor], Tensor],
-        support_dataset: list[Tensor],
-        grouping_strategy: str | AbstractGroupingStrategy,
+        background_dataset: Sequence[Tensor] | None = None,
+        train_dataset: Sequence[Tensor] | None = None,
+        background_dataset_strategy: BackgroundDatasetStrategy = BackgroundDatasetStrategy.RANDOM,
+        background_size: int | None = None,
+        train_labels: Sequence[int] | Tensor | None = None,
+        grouping_strategy: str | AbstractGroupingStrategy = "time",
         subsets_generation_strategy: StrategySubsets = StrategySubsets.APPROX,
         m: int = 5,
         batch_size: int = 32,
@@ -1076,258 +721,204 @@ class FastShaTSIG(FastShaTS):
             "cuda" if torch.cuda.is_available() else "cpu"
         ),
         custom_groups: list[list[int]] | None = None,
-        # Hiperparámetros IG / temporal
+        random_state: int | None = None,
+        entropy_bins: int = 32,
+        kmeans_max_iter: int = 100,
+        kmeans_tolerance: float = 1e-4,
         distance_threshold: float = 0.05,
         pred_distance_threshold: float | None = None,
-        recalculation_mode: str = "x",  # "x" | "pred" | "x_or_pred"
+        recalculation_mode: str = "x",
         force_full_every: int = 100,
         ig_steps: int = 32,
         ig_lambda: float = 1.0,
         ig_class_idx: int = 1,
+        categorical_feature_indices: Sequence[int] | None = None,
+        detect_categorical_features: bool = True,
     ) -> None:
         super().__init__(
             model_wrapper=model_wrapper,
-            support_dataset=support_dataset,
+            background_dataset=background_dataset,
+            train_dataset=train_dataset,
+            background_dataset_strategy=background_dataset_strategy,
+            background_size=background_size,
+            train_labels=train_labels,
             grouping_strategy=grouping_strategy,
             subsets_generation_strategy=subsets_generation_strategy,
             m=m,
             batch_size=batch_size,
             device=device,
             custom_groups=custom_groups,
+            random_state=random_state,
+            entropy_bins=entropy_bins,
+            kmeans_max_iter=kmeans_max_iter,
+            kmeans_tolerance=kmeans_tolerance,
         )
 
         self.grad_model_wrapper = grad_model_wrapper
-        self.distance_threshold = distance_threshold
-        self.pred_distance_threshold = None if pred_distance_threshold is None else float(pred_distance_threshold)
+        self.distance_threshold = float(distance_threshold)
+        self.pred_distance_threshold = (
+            None if pred_distance_threshold is None else float(pred_distance_threshold)
+        )
         self.recalculation_mode = recalculation_mode
         self.force_full_every = force_full_every
         self.ig_steps = ig_steps
         self.ig_lambda = ig_lambda
         self.ig_class_idx = ig_class_idx
 
-    # ----------------- utilidades internas -----------------
+        if categorical_feature_indices is not None:
+            self.categorical_feature_indices = sorted(set(int(index) for index in categorical_feature_indices))
+        elif detect_categorical_features:
+            self.categorical_feature_indices = infer_binary_feature_indices(
+                self.background_dataset
+            )
+        else:
+            self.categorical_feature_indices = []
 
     def _input_distance(self, x_new: Tensor, x_old: Tensor) -> float:
         """
-        Distancia relativa global entre dos ventanas.
+        Compute the relative input distance between two windows.
         """
         diff = x_new - x_old
-        num = torch.norm(diff)
-        den = torch.norm(x_old) + 1e-8
-        return float((num / den).item())
-    
-    def _pred_distance(self, x_prev: torch.Tensor, x_curr: torch.Tensor) -> float:
-        # model_wrapper devuelve probs [B,C] 
+        numerator = torch.norm(diff)
+        denominator = torch.norm(x_old) + 1e-8
+        return float((numerator / denominator).item())
+
+    def _pred_distance(self, x_prev: Tensor, x_curr: Tensor) -> float:
+        """
+        Compute the L1 distance between the model predictions of two windows.
+        """
         with torch.no_grad():
-            p_prev = self.model_wrapper(x_prev)  # [1,C] o [B,C]
-            p_curr = self.model_wrapper(x_curr)
-        # distancia L1 sobre probabilidades 
+            p_prev = self._call_model(x_prev)
+            p_curr = self._call_model(x_curr)
         return float(torch.abs(p_curr - p_prev).sum().item())
 
-
-    def _group_ig_from_tensor(self, ig_tensor: Tensor) -> Tensor:
+    def _integrated_gradients_groups(self, x_start: Tensor, x_end: Tensor) -> Tensor:
         """
-        Dado un tensor IG de forma [T, F] (integrated gradients en el espacio
-        de entrada), lo agrega a nivel de grupo ShaTS.
-
-        Devuelve un tensor [groups_num] (solo para la clase ig_class_idx).
+        Compute group-level Integrated Gradients between two windows.
         """
-        ig_np = ig_tensor.detach().cpu().numpy()
-        group_scores = np.zeros(self.groups_num, dtype=np.float32)
-
-
-        # Caso 1: agrupación temporal (cada grupo = un instante)
-        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
-            # groups_num == window_size
-            for g in range(self.groups_num):
-                # IG del instante g en todas las features
-                group_scores[g] = float(np.sum((ig_np[g, :])))
-
-        # Caso 2: agrupación por feature (cada grupo = una feature)
-        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
-            # groups_num == num_features
-            for g in range(self.groups_num):
-                # IG de todas las time-steps para la feature g
-                group_scores[g] = float(np.sum((ig_np[:, g])))
-
-        # Caso 3: multifeature (cada grupo = conjunto de features)
-        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
-            custom_groups = self.grouping_strategy._custom_groups  # ya existe
-            for g, feat_idxs in enumerate(custom_groups):
-                sub = ig_np[:, feat_idxs]  # [T, |group|]
-                group_scores[g] = float(np.sum((sub)))
-
-        else:
-            # Fallback: todo a un único grupo global
-            total = float(np.sum((ig_np)))
-            group_scores[:] = total / max(self.groups_num, 1)
-
-        return torch.tensor(group_scores, device=self.device)
-
-
-    def _build_group_directions_like_shats(self, x: Tensor, baseline: Tensor) -> Tensor:
-        """
-        d_stack[g] = (x - baseline) restringido al grupo g.
-        return: [G, T, F]
-        """
-        diff = x - baseline
-        T, F = diff.shape
-        G = self.groups_num
-
-        d_stack = torch.zeros(G, T, F, device=self.device, dtype=x.dtype)
-
-        if isinstance(self.grouping_strategy, TimeGroupingStrategy):
-            for g in range(G):
-                d_stack[g, g, :] = diff[g, :]
-        elif isinstance(self.grouping_strategy, FeaturesGroupingStrategy):
-            for g in range(G):
-                d_stack[g, :, g] = diff[:, g]
-        elif isinstance(self.grouping_strategy, MultifeaturesGroupingStrategy):
-            custom_groups = self.grouping_strategy._custom_groups
-            for g, feat_idxs in enumerate(custom_groups):
-                d_stack[g, :, feat_idxs] = diff[:, feat_idxs]
-        else:
-            # fallback: reparte el diff entero
-            for g in range(G):
-                d_stack[g] = diff
-
-        return d_stack
-
-
-
-
-    def _integrated_gradients_groups(
-        self,
-        x_start: Tensor,
-        x_end: Tensor,
-    ) -> Tensor:
-        """
-        IG a lo largo de la recta x(alpha) = x_start + alpha * (x_end - x_start),
-        agregando luego a nivel de grupo ShaTS.
-
-        Devuelve un tensor [groups_num] con la contribución para la clase
-        self.ig_class_idx.
-        """
-        # x_start, x_end: [T, F]
-        x_start = x_start.to(self.device)
-        x_end = x_end.to(self.device)
-
-        # Recta en el input space
-        alphas = torch.linspace(
-            0.0, 1.0, steps=self.ig_steps, device=self.device
-        ).view(-1, 1, 1)  # [S,1,1]
-        direction = (x_end - x_start).unsqueeze(0)  # [1,T,F]
-        path = x_start.unsqueeze(0) + alphas * direction  # [S,T,F]
-        path.requires_grad_(True)
-
-        # forward
-        probs = self.grad_model_wrapper(path)  # [S, C] (S = ig_steps)
-        # sumamos todas las alphas para obtener un escalar y poder llamar a autograd
-        target = probs[:, self.ig_class_idx].sum()
-
-        grads = torch.autograd.grad(target, path)[0]  # [S,T,F]
-        avg_grads = grads.mean(dim=0)  # [T,F]
-
-        ig_tensor = direction.squeeze(0) * avg_grads  # [T,F]
-
-        # Agregamos por grupo
-        group_ig = self._group_ig_from_tensor(ig_tensor)  # [groups_num]
-        return group_ig
+        return integrated_gradients_groups_direct(
+            model_wrapper=self.grad_model_wrapper,
+            x=x_end,
+            baseline=x_start,
+            grouping_strategy=self.grouping_strategy,
+            class_idx=self.ig_class_idx,
+            steps=self.ig_steps,
+            device=self.device,
+            categorical_feature_indices=self.categorical_feature_indices,
+        )
 
     def _compute_full_shap_single(self, x: Tensor) -> Tensor:
         """
-        Calcula FastShaTS 'completo' para UNA sola ventana x (forma [T,F]).
-        Devuelve [groups_num, nclass].
+        Compute a full FastShaTS explanation for one window.
         """
-        # super().compute espera una lista de tensores
         with torch.no_grad():
-            full = super().compute([x])  # [1, G, C]
-        return full[0]  # [G, C]
-   
-    def compute(self, test_dataset: list[Tensor], return_diagnostics: bool = False):
-        N = len(test_dataset)
-        shats_values = torch.zeros(N, self.groups_num, self.nclass, device=self.device)
+            full = super().compute([x])
+        return full[0]
+
+    def compute(
+        self,
+        test_dataset: Sequence[Tensor],
+        return_diagnostics: bool = False,
+    ) -> Tensor | tuple[Tensor, list[float], list[bool]]:
+        """
+        Compute FastShaTSIG values for the given test dataset.
+        """
+        validate_window_dataset(test_dataset, "test_dataset")
+        num_instances = len(test_dataset)
+        shats_values = torch.zeros(
+            num_instances,
+            self.groups_num,
+            self.nclass,
+            device=self.device,
+        )
 
         prev_x: Tensor | None = None
         prev_shap: Tensor | None = None
 
-        times: list[float] = [0.0] * N
-        approx_flags: list[bool] = [False] * N  # True si fue IG/reuso, False si full
+        times: list[float] = [0.0] * num_instances
+        approx_flags: list[bool] = [False] * num_instances
 
         full_recomputes = 0
         ig_updates = 0
 
-        t_global = time.perf_counter()
-        ema = None
+        global_start = time.perf_counter()
+        ema: float | None = None
 
         for idx, x in enumerate(test_dataset):
             x = x.to(self.device)
+            step_start = time.perf_counter()
 
-            t0 = time.perf_counter()
-
-            # ---------- decide need_full ----------
             need_full = False
             if idx == 0:
                 need_full = True
-            elif self.force_full_every > 0 and (idx % self.force_full_every == 0):
+            elif self.force_full_every > 0 and idx % self.force_full_every == 0:
                 need_full = True
             elif prev_x is None or prev_shap is None:
                 need_full = True
             else:
-                dist_x = self._input_distance(x, prev_x)
-                dist_p = None
-                if self.pred_distance_threshold is not None:
-                    dist_p = self._pred_distance(prev_x, x)
+                distance_x = self._input_distance(x, prev_x)
+                distance_p = (
+                    self._pred_distance(prev_x, x)
+                    if self.pred_distance_threshold is not None
+                    else None
+                )
 
-                mode = getattr(self, "recalculation_mode", "x")
-                if mode == "x":
-                    need_full = (dist_x > self.distance_threshold)
-                elif mode == "pred":
-                    if self.pred_distance_threshold is None or dist_p is None:
-                        need_full = (dist_x > self.distance_threshold)
+                if self.recalculation_mode == "x":
+                    need_full = distance_x > self.distance_threshold
+                elif self.recalculation_mode == "pred":
+                    if self.pred_distance_threshold is None or distance_p is None:
+                        need_full = distance_x > self.distance_threshold
                     else:
-                        need_full = (dist_p > self.pred_distance_threshold)
-                elif mode == "x_or_pred":
-                    if self.pred_distance_threshold is None or dist_p is None:
-                        need_full = (dist_x > self.distance_threshold)
+                        need_full = distance_p > self.pred_distance_threshold
+                elif self.recalculation_mode == "x_or_pred":
+                    if self.pred_distance_threshold is None or distance_p is None:
+                        need_full = distance_x > self.distance_threshold
                     else:
-                        need_full = (dist_x > self.distance_threshold) or (dist_p > self.pred_distance_threshold)
+                        need_full = (
+                            distance_x > self.distance_threshold
+                            or distance_p > self.pred_distance_threshold
+                        )
                 else:
-                    raise ValueError(f"Unknown recalculation_mode={mode!r}")
+                    raise ValueError(
+                        f"Unknown recalculation_mode={self.recalculation_mode!r}."
+                    )
 
-            # ---------- ejecuta ----------
             if need_full:
                 full_recomputes += 1
-                shap_t = self._compute_full_shap_single(x)  # [G,C]
+                shap_t = self._compute_full_shap_single(x)
                 prev_x, prev_shap = x, shap_t
                 approx_flags[idx] = False
             else:
                 ig_updates += 1
-                group_ig = self._integrated_gradients_groups(prev_x, x)  # [G]
+                group_ig = self._integrated_gradients_groups(prev_x, x)
                 shap_t = prev_shap.clone()
-                shap_t[:, self.ig_class_idx] = shap_t[:, self.ig_class_idx] + self.ig_lambda * group_ig
+                shap_t[:, self.ig_class_idx] = (
+                    shap_t[:, self.ig_class_idx] + self.ig_lambda * group_ig
+                )
+                prev_x, prev_shap = x, shap_t
                 approx_flags[idx] = True
 
             shats_values[idx] = shap_t
 
-            t1 = time.perf_counter()
-            times[idx] = (t1 - t0)
+            step_end = time.perf_counter()
+            times[idx] = step_end - step_start
 
-            # ---------- progreso + ETA ----------
-            step = times[idx]
-            ema = step if ema is None else (0.1 * step + 0.9 * ema)
-            if ((idx + 1) % 50 == 0) or (idx + 1 == N):
-                elapsed = t1 - t_global
-                eta = ema * (N - (idx + 1))
+            current_step = times[idx]
+            ema = current_step if ema is None else (0.1 * current_step + 0.9 * ema)
+            if ((idx + 1) % 50 == 0) or (idx + 1 == num_instances):
+                elapsed = step_end - global_start
+                eta = ema * (num_instances - (idx + 1))
                 print(
-                    f"\rFastShaTSIG - Processing {idx + 1}/{N} "
-                    f"({(idx + 1) / N * 100.0:.2f}%) | full={full_recomputes} | ig={ig_updates} | "
+                    f"\rFastShaTSIG - Processing {idx + 1}/{num_instances} "
+                    f"({(idx + 1) / num_instances * 100.0:.2f}%) | "
+                    f"full={full_recomputes} | ig={ig_updates} | "
                     f"elapsed={elapsed:.1f}s | ETA={eta:.1f}s",
                     end="",
                     flush=True,
                 )
 
         print()
+
         if return_diagnostics:
             return shats_values, times, approx_flags
         return shats_values

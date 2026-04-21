@@ -25,6 +25,8 @@ by allowing the user to define custom groups of features. Each group
 is conformed by all the time steps of every feature in the group.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import NamedTuple
 
@@ -32,7 +34,7 @@ import torch
 from torch import Tensor
 from torch import device as TorchDevice
 
-from .utils import Subset
+Subset = tuple[int, ...]
 
 
 class GroupingPlotTexts(NamedTuple):
@@ -73,7 +75,7 @@ class AbstractGroupingStrategy(ABC):
         self,
         subset: Subset,
         device: str | int | TorchDevice,
-        support_tensor: Tensor,
+        background_tensor: Tensor,
         tensor: Tensor,
     ) -> Tensor:
         """
@@ -118,11 +120,11 @@ class TimeGroupingStrategy(AbstractGroupingStrategy):
         self,
         subset: Subset,
         device: str | int | TorchDevice,
-        support_tensor: Tensor,
+        background_tensor: Tensor,
         tensor: Tensor,
     ) -> Tensor:
         indexes = torch.tensor(list(subset), dtype=torch.long, device=device)
-        tensor[:, indexes, :] = support_tensor[:, indexes, :].clone()
+        tensor[:, indexes, :] = background_tensor[:, indexes, :].clone()
         return tensor.clone()
 
 
@@ -140,12 +142,12 @@ class FeaturesGroupingStrategy(AbstractGroupingStrategy):
         self,
         subset: Subset,
         device: str | int | TorchDevice,
-        support_tensor: Tensor,
+        background_tensor: Tensor,
         tensor: Tensor,
     ) -> Tensor:
         indexes = torch.tensor(list(subset), dtype=torch.long, device=device)
-        for instant in range(support_tensor[0].shape[0]):
-            tensor[:, instant, indexes] = support_tensor[:, instant, indexes].clone()
+        for instant in range(background_tensor[0].shape[0]):
+            tensor[:, instant, indexes] = background_tensor[:, instant, indexes].clone()
         return tensor.clone()
 
 
@@ -167,15 +169,26 @@ class MultifeaturesGroupingStrategy(AbstractGroupingStrategy):
         groups_num: int | None = None,
         names: list[str] | None = None,
     ) -> None:
+        if groups_num is None:
+            groups_num = len(custom_groups)
+        elif groups_num != len(custom_groups):
+            raise ValueError(
+                "If groups_num is provided, it must match the number of custom groups"
+            )
+
         super().__init__(groups_num, names)
 
         self._custom_groups = custom_groups
+
+    @property
+    def custom_groups(self) -> list[list[int]]:
+        return self._custom_groups
 
     def modify_tensor(
         self,
         subset: Subset,
         device: str | int | TorchDevice,
-        support_tensor: Tensor,
+        background_tensor: Tensor,
         tensor: Tensor,
     ) -> Tensor:
         all_indexes = list[int]()
@@ -184,6 +197,6 @@ class MultifeaturesGroupingStrategy(AbstractGroupingStrategy):
             all_indexes.extend(self._custom_groups[group])
         indexes_tensor = torch.tensor(all_indexes, dtype=torch.long, device=device)
 
-        tensor[:, :, indexes_tensor] = support_tensor[:, :, all_indexes].clone()
+        tensor[:, :, indexes_tensor] = background_tensor[:, :, all_indexes].clone()
 
         return tensor

@@ -25,10 +25,27 @@ This repository includes:
    - **Feature Grouping:** Evaluates the importance of all the measurements of each individual feature across the time window.
    - **Multi-Feature Grouping:** Enables custom groupings that consolidate related features (such as those representing a specific sensor/actuator or an entire industrial process) to deliver more coherent and actionable explanations.
 
-3. **Scalability and Efficiency:**  
-   By incorporating approximate methods for Shapley value computation, ShaTS effectively handles the high computational complexity associated with time series data and scales to large models and datasets without sacrificing performance.
+3. **Flexible background dataset handling**  
+   ShaTS supports two ways of defining the background dataset:
+   - Passing an explicit `background_dataset`.
+   - Inferring the `background_dataset` from the full `train_dataset`.
 
-4. **Integrated Visualization Tools:**  
+   The background dataset can be inferred using different strategies:
+   - **RANDOM**: random sample from the training dataset.
+   - **ENTROPY**: selects the samples with the highest entropy.
+   - **STRATIFIED**: preserves the class proportions of the training dataset.
+   - **KMEANS**: computes `k` centroids from the training dataset and uses them as the background dataset.
+
+4. **Scalability and Efficiency:**  
+   By incorporating approximate methods for Shapley value computation, ShaTS effectively handles the high computational complexity associated with time series data and scales to large models and datasets without sacrificing performance. The library currently exposes the following explainers:
+
+   - **ApproShaTS**
+   - **FastShaTS**
+   - **KernelShaTS**
+   - **CachedKernelShaTS**
+   - **FastShaTSIG**
+
+5. **Integrated Visualization Tools:**  
    Custom plotting capabilities allow users to analyze feature contributions over time, providing intuitive visual summaries of how various groups impact the model’s output and facilitating faster decision-making in real-world applications.
 
 
@@ -67,7 +84,7 @@ cd <repo_directory>
 pip install -r requirements.txt
 ```
 
-The example notebooks located in the [tests folder](tests/) require additional dependencies. Before running the notebooks, install the extra requirements with:
+The example notebooks located in the [examples folder](examples_notebooks/) require additional dependencies. Before running the notebooks, install the extra requirements with:
 ```bash
 pip install -r tests/requirements.txt
 ```
@@ -75,7 +92,25 @@ pip install -r tests/requirements.txt
 
 
 ## Usage
-The examples notebooks provided in the [tests folder](tests/) provides a step-by-step guide on using ShaTS. Below is a quick example:
+The examples notebooks provided in the [examples folder](example_notebooks/) provides a step-by-step guide on using ShaTS. Below is a quick example:
+
+### 0. Data format
+
+ShaTS expects datasets to be provided as **lists of tensors**, where each tensor has shape:
+
+```python
+[time, features]
+```
+
+For example, a dataset is expected to look like:
+
+```python
+dataset = [
+    tensor_1,  # shape [T, F]
+    tensor_2,  # shape [T, F]
+    ...
+]
+```
 
 ### 1. Import ShaTS and configure the Explainer
 
@@ -88,17 +123,49 @@ from shats.grouping import FeaturesGroupingStrategy
 from shats.grouping import MultifeaturesGroupingStrategy
 ```
 
-### 2. Initialize the Model and Data
+### 2. Define the model wrapper
 
-Assume you have a pre-trained time series PyTorch model (if you would like to see the steps for a Keras model go to [keras example](tests/example_keras/)) and a background dataset, which should be a list of tensors representing typical data samples that the model has seen during training.
+Assume you have a pre-trained time series PyTorch model (if you would like to see the steps for a Keras model go to [keras example](example_notebooks/example_keras/)). The explainer expects a callable that receives a tensor and returns a tensor of shape `[batch, nclass]`.
+
+
+
+```python
+def model_wrapper(x):
+    return model(x)
+```
+
+If your model receives a single window with shape `[T, F]`, the wrapper should internally add the batch dimension when needed.
+
+
+#### Option A: Use an explicit background dataset
+
+Use this option when you already have a background dataset prepared.
 
 ```python
 model = MyTrainedModel()
-support = [...]  
+background_dataset = [...]  # list of tensors with shape [T, F]
 
-shapley_class = shats.FastShaTS(model, 
-    support_dataset=support,
-    grouping_strategy= FeaturesGroupingStrategy(names=variable_names)
+explainer = shats.FastShaTS(
+    model_wrapper=model_wrapper,
+    background_dataset=background_dataset,
+    grouping_strategy=FeaturesGroupingStrategy(names=variable_names),
+)
+```
+
+#### Option B: Infer the background dataset from the training dataset
+
+Use this option when you want ShaTS to build the background dataset automatically.
+
+```python
+model = MyTrainedModel()
+train_dataset = [...]  # list of tensors with shape [T, F]
+
+explainer = shats.FastShaTS(
+    model_wrapper=model_wrapper,
+    train_dataset=train_dataset,
+    background_size=20,
+    background_dataset_strategy=BackgroundDatasetStrategy.RANDOM,
+    grouping_strategy="feature",
 )
 ```
 
@@ -109,7 +176,7 @@ testDataset = [...]
 shats_values = shaTS.compute(testDataset)
 ```
 
-### 4. Visualize Results
+### 4. Plot Results
 ShaTS includes a plotting function to help visualize the Shapley value attributions. This visualization uses a heatmap to display the contribution of each group (depending on the chosen strategy) over time. The plot also overlays the model’s predicted probability to facilitate interpretation.
 
 ```python
@@ -136,6 +203,11 @@ The repository is organized as follows:
 │       ├── shats.py         # Main ShaTS implementation
 │       └── utils.py         # Utility functions and strategy enums
 └── tests
+│      ├── test_background.py             # Test background
+│      ├── test_igExplainer.py            # Test IG Explainer
+│      └── test_shats_initialization.py   # Test ShaTS inicialization
+│  
+└── example_notebooks
     ├── example_SWaT
     │   ├── ADmodel.pt       # Trained model for SWaT
     │   └── example.ipynb    # Usage example with SWaT
@@ -146,6 +218,7 @@ The repository is organized as follows:
         ├── KerasModel.h5    # Trained model on Keras
         ├── example.ipynb    # Usage example with toy dataset
         └── requirements.txt # Specific requirements
+
 ```
 
 # Web demo
